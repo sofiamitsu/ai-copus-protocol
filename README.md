@@ -1,5 +1,3 @@
-# Thesis Pipeline — Project Overview for Claude Code
-
 ## Project
 
 **Bridging the Feedback Gap: Enhancing STEM Instruction through AI-Driven Classroom Analytics**
