@@ -1,0 +1,6 @@
+[server]
+# Lecture .mp4 files can be 500MB–2GB; raise Streamlit's 200MB default.
+maxUploadSize = 3000
+
+[browser]
+gatherUsageStats = false

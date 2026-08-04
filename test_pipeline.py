@@ -26,30 +26,43 @@ ARM_CONFIG = {
 }
 
 
-def run_arm(arm_name, max_chunks):
+def run_arm(arm_name, chunks_dir, results_dir, output_csv, lecture_id,
+            max_chunks, window_seconds=WINDOW_SECONDS):
+    """
+    Classify every chunk for one arm, then aggregate to a CSV.
+    Skips a chunk if its per-chunk result JSON already exists (idempotent),
+    so re-runs make no new Gemini calls.
+    """
     cfg = ARM_CONFIG[arm_name]
-    results_dir = f"output/pipeline_test/results_{arm_name}"
-    output_csv = f"output/pipeline_test/results_{arm_name}.csv"
 
     print(f"\n=== Classifying arm: {arm_name} ===")
     for i in range(max_chunks):
-        chunk_path = os.path.join(CHUNKS_DIR, f"chunk_{i:03d}_{cfg['suffix']}.{cfg['ext']}")
+        chunk_path = os.path.join(chunks_dir, f"chunk_{i:03d}_{cfg['suffix']}.{cfg['ext']}")
         if not os.path.exists(chunk_path):
             print(f"Chunk {i} not found, skipping")
             continue
-        cfg["fn"](
-            chunk_path,
-            chunk_index=i,
-            output_dir=results_dir,
-            window_start=i * WINDOW_SECONDS,
-            window_end=(i + 1) * WINDOW_SECONDS,
-        )
+        result_json = os.path.join(results_dir, f"chunk_{i:03d}_result.json")
+        if os.path.exists(result_json):
+            print(f"Chunk {i} already classified, skipping")
+            continue
+        try:
+            cfg["fn"](
+                chunk_path,
+                chunk_index=i,
+                output_dir=results_dir,
+                window_start=i * window_seconds,
+                window_end=(i + 1) * window_seconds,
+            )
+        except Exception as e:
+            # Don't crash the whole run on one bad chunk — log and skip it.
+            print(f"  [ERROR] chunk {i} arm {arm_name} failed: {e}")
+            continue
 
     print(f"\n=== Aggregating arm: {arm_name} ===")
     aggregate_results(
         chunks_dir=results_dir,
         output_csv=output_csv,
-        lecture_id=LECTURE_ID,
+        lecture_id=lecture_id,
         arm=arm_name,
     )
     return output_csv
@@ -71,7 +84,14 @@ if __name__ == "__main__":
     arms_to_run = list(ARM_CONFIG) if args.arm == "all" else [args.arm]
     output_csvs = {}
     for arm_name in arms_to_run:
-        output_csvs[arm_name] = run_arm(arm_name, args.max_chunks)
+        output_csvs[arm_name] = run_arm(
+            arm_name,
+            chunks_dir=CHUNKS_DIR,
+            results_dir=f"output/pipeline_test/results_{arm_name}",
+            output_csv=f"output/pipeline_test/results_{arm_name}.csv",
+            lecture_id=LECTURE_ID,
+            max_chunks=args.max_chunks,
+        )
 
     print(f"\nDone! Results: {output_csvs}")
 
