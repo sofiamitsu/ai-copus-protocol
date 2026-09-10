@@ -53,6 +53,8 @@ ACTIVE_LEARNING_CODES = {"FUp", "PQ", "CQ", "AnQ", "MG", "1o1", "D/V"}
 # Passive / transmission-style codes (the rest that count as "teaching time").
 PASSIVE_CODES = {"Lec", "RtW", "Adm", "W"}
 
+from validate.validator import MEAN_ROW_LABEL, mean_kappa
+
 # Reliability bands for Cohen's kappa (Landis & Koch).
 KAPPA_BANDS = [
     (0.81, "Almost perfect", colors.HexColor("#2E7D32")),
@@ -138,7 +140,7 @@ def load_kappa_dict(kappa_results):
         {comparison_name: {code: kappa}}.
 
     Accepts either that dict directly, or a path to a `combined_kappa.csv`
-    (columns: code, ai_vs_sofia_kappa, ai_vs_kaw_kappa, sofia_vs_kaw_kappa).
+    (columns: code, ai_vs_sofia_kappa).
     """
     if kappa_results is None:
         return {}
@@ -149,14 +151,14 @@ def load_kappa_dict(kappa_results):
     out = {}
     for col, name in (
         ("ai_vs_sofia_kappa", "AI vs Sofia"),
-        ("ai_vs_kaw_kappa", "AI vs Dr. Kaw"),
-        ("sofia_vs_kaw_kappa", "Sofia vs Dr. Kaw"),
     ):
         if col in df.columns:
+            # N/A rows are KEPT: a code neither rater used must still show as
+            # N/A in the report, not silently disappear from the table.
             out[name] = {
-                r["code"]: r[col]
+                r["code"]: ("N/A" if str(r[col]).strip() in ("", "N/A", "nan")
+                            else r[col])
                 for _, r in df.iterrows()
-                if str(r[col]).strip() not in ("", "N/A", "nan")
             }
     return out
 
@@ -413,6 +415,10 @@ def _kappa_table(kappa_dict):
     """
     comparisons = list(kappa_dict.keys())
     codes = sorted({c for m in kappa_dict.values() for c in m})
+    # MEAN is a summary row, not a COPUS code — keep it pinned at the bottom
+    # instead of alphabetized in among Adm/AnQ/CQ.
+    if MEAN_ROW_LABEL in codes:
+        codes = [c for c in codes if c != MEAN_ROW_LABEL] + [MEAN_ROW_LABEL]
     header = ["Code"] + comparisons
     data = [header]
     for code in codes:
@@ -439,6 +445,10 @@ def _kappa_table(kappa_dict):
         for ci, comp in enumerate(comparisons, start=1):
             _, color = _kappa_band(kappa_dict[comp].get(code, "N/A"))
             style.append(("TEXTCOLOR", (ci, ri), (ci, ri), color))
+        if code == MEAN_ROW_LABEL:
+            style.append(("LINEABOVE", (0, ri), (-1, ri), 1,
+                          colors.HexColor("#003366")))
+            style.append(("FONTNAME", (0, ri), (-1, ri), "Helvetica-Bold"))
     table.setStyle(TableStyle(style))
     return table
 
@@ -587,25 +597,13 @@ def generate_faculty_report(
     story.append(Paragraph("Validation Summary", styles["SectionH"]))
     if kappa_dict:
         story.append(Paragraph(
-            "Cohen's κ between the AI classifier and human coders, and between "
-            "human coders (inter-rater reliability), computed per COPUS code "
-            "and pooled across lectures. Higher κ indicates stronger agreement.",
+            "Cohen's κ between the AI classifier and the human coder, computed per "
+            "COPUS code and pooled across lectures. Higher κ indicates stronger "
+            "agreement.",
             styles["Narrative"]))
         story.append(_kappa_table(kappa_dict))
         story.append(Spacer(1, 0.15 * inch))
         story.append(_legend_flowable(styles))
-        if "Sofia vs Dr. Kaw" in kappa_dict:
-            vals = [pd.to_numeric(v, errors="coerce")
-                    for v in kappa_dict["Sofia vs Dr. Kaw"].values()]
-            vals = [v for v in vals if pd.notna(v)]
-            if vals:
-                mean_k = sum(vals) / len(vals)
-                story.append(Spacer(1, 0.1 * inch))
-                story.append(Paragraph(
-                    f"Inter-rater reliability between the two human coders "
-                    f"(Sofia vs Dr. Kaw) averaged κ = {mean_k:.2f} across codes, "
-                    f"providing a human benchmark for interpreting the AI's "
-                    f"agreement scores.", styles["Narrative"]))
     else:
         story.append(Paragraph(
             "No validation (kappa) data was provided for this report.",

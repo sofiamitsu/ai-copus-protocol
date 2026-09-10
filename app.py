@@ -12,6 +12,7 @@ The pipeline runs in a background thread so the UI can stream log output,
 show a live progress bar, and offer a Cancel button while it works.
 """
 import io
+import math
 import os
 import queue
 import re
@@ -26,6 +27,8 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from classify.classifier import DEFAULT_MODEL, VALID_MODELS
+from utils.sparse_windows import plan_sparse_windows, probe_duration_minutes, write_template
 from run import (
     ARM_CONFIG,
     process_lecture,
@@ -35,7 +38,7 @@ from run import (
 )
 
 WINDOW_SECONDS = 120
-KAPPA_COLS = ["ai_vs_sofia_kappa", "ai_vs_kaw_kappa", "sofia_vs_kaw_kappa"]
+KAPPA_COLS = ["ai_vs_sofia_kappa"]
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +100,12 @@ class PipelineRunner:
 
     def _pipeline(self):
         cfg = self.config
-        lectures = cfg["lectures"]  # list of (path, id, sofia, kaw)
+        lectures = cfg["lectures"]  # list of (path, id, sofia, windows)
         n = len(lectures)
         total_steps = n + 1  # per-lecture work + professor-level rollup
 
         lecture_infos = []
-        for i, (path, lid, sofia, kaw) in enumerate(lectures):
+        for i, (path, lid, sofia, windows) in enumerate(lectures):
             if self.cancel_event.is_set():
                 self.cancelled = True
                 self.log_queue.put(f"\n[CANCELLED] stopped before {lid}\n")
@@ -112,12 +115,15 @@ class PipelineRunner:
                 lecture_path=path,
                 lecture_id=lid,
                 sofia_xlsx=sofia,
-                kaw_xlsx=kaw,
                 lecture_dir=os.path.join(cfg["output_dir"], lid),
                 arms_to_run=cfg["arms_to_run"],
                 primary_arm=cfg["primary_arm"],
-                max_chunks=cfg["max_chunks"],
+                # Each lecture carries its own window set — the schedule depends
+                # on that lecture's duration, so one global list will not do.
+                max_chunks=None if windows else cfg["max_chunks"],
                 window_seconds=WINDOW_SECONDS,
+                window_indices=windows,
+                model=cfg.get("model", DEFAULT_MODEL),
             )
             lecture_infos.append(info)
 
@@ -152,6 +158,59 @@ class PipelineRunner:
 # ---------------------------------------------------------------------------
 def _slug(text):
     return re.sub(r"[^a-z0-9]+", "_", (text or "professor").lower()).strip("_") or "professor"
+
+
+# Video containers ffmpeg can chunk. The pipeline itself is format-agnostic --
+# chunk_video probes with ffprobe -- so this list only gates the uploader widget.
+VIDEO_TYPES = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "mpeg4"]
+
+
+class _PathFile:
+    """Duck-types the bits of Streamlit's UploadedFile the setup screen reads."""
+
+    def __init__(self, path):
+        self.name = os.path.basename(path)
+        self.size = os.path.getsize(path)
+
+
+def _persist_upload(uploaded, key):
+    """
+    Save an uploaded file once per session and return its path.
+
+    ffprobe needs a real file, and Streamlit reruns on every widget interaction —
+    rewriting a multi-hundred-MB lecture each time would make the page unusable.
+    Keyed on name+size so replacing the file re-saves it.
+    """
+    if "probe_dir" not in ss:
+        ss.probe_dir = tempfile.mkdtemp(prefix="copus_uploads_")
+    cache = ss.setdefault("upload_paths", {})
+    sig = f"{uploaded.name}:{uploaded.size}"
+    if cache.get(key, (None, None))[0] == sig:
+        return cache[key][1]
+    path = os.path.join(ss.probe_dir, f"{key}_{re.sub(r'[^A-Za-z0-9._-]', '_', uploaded.name)}")
+    with open(path, "wb") as f:
+        f.write(uploaded.getbuffer())
+    cache[key] = (sig, path)
+    return path
+
+
+def _lecture_plan(path):
+    """(duration_min, indices, scheme, blocks) for a lecture, cached per path."""
+    cache = ss.setdefault("plans", {})
+    if path not in cache:
+        duration = probe_duration_minutes(path)
+        with contextlib.redirect_stdout(io.StringIO()):  # swallow the short-lecture warning
+            indices, scheme, blocks = plan_sparse_windows(duration, WINDOW_SECONDS / 60)
+        cache[path] = (duration, indices, scheme, blocks)
+    return cache[path]
+
+
+def _template_bytes(indices, duration_min, name):
+    """Build a COPUS coding sheet for these windows and return it as bytes."""
+    tmp = os.path.join(tempfile.mkdtemp(prefix="copus_tpl_"), name)
+    write_template(tmp, indices, WINDOW_SECONDS / 60, duration_min)
+    with open(tmp, "rb") as f:
+        return f.read()
 
 
 def _save_upload(uploaded, dest_dir, name):
@@ -256,8 +315,12 @@ with st.sidebar:
     st.divider()
     arm = st.selectbox("Classification arm", list(ARM_CONFIG) + ["all"], index=0,
                        help="'all' runs the full 4-arm ablation study.")
+    model = st.selectbox("Gemini model", VALID_MODELS,
+                         index=VALID_MODELS.index(DEFAULT_MODEL),
+                         help="Flash for dev, Pro for final validation.")
     cap = st.number_input("Max windows per lecture (0 = all)", min_value=0, value=0, step=1,
-                          help="Cap 2-min windows per lecture for a quick test run.")
+                          help="Cap 2-min windows per lecture for a quick test run. "
+                               "Ignored for lectures that have a window set.")
 
 st.title("🎓 COPUS Classroom Analytics Pipeline")
 st.caption("Runs locally — no video or data leaves this machine.")
@@ -311,44 +374,143 @@ if ss.stage == "running":
 # =========================== IDLE / SETUP ===========================
 elif ss.stage == "idle":
     st.subheader("1 · Lecture Videos")
-    lecture_files = [
-        st.file_uploader(f"Lecture {i + 1}", type=["mp4"], key=f"lec_{i}")
-        for i in range(3)
-    ]
-    for f in lecture_files:
-        if f:
-            st.caption(f"✓ {f.name} — {f.size / 1e6:.1f} MB")
+    st.caption(
+        "Add a lecture and the app reads its duration, works out which windows to code, "
+        "and builds the coding sheet for you — no terminal needed. Paste a file path "
+        "(best for large recordings) **and press Enter**, or upload the file."
+    )
+    # Two ways in. Uploading pushes the whole file through the browser and buffers
+    # it server-side, which is painful past a couple of GB — and pointless, since
+    # the app runs locally and the file is already on this disk. So a path is the
+    # default for real lecture recordings.
+    # One block per lecture: its inputs AND its plan render together, so the
+    # coding sheet appears directly under the lecture it belongs to.
+    lecture_files, lecture_paths, lecture_windows, lecture_ids = {}, {}, {}, {}
+    for i in range(3):
+        st.markdown(f"### Lecture {i + 1}")
+        typed = (st.text_input(
+            f"Path to lecture {i + 1} on this machine — press Enter after pasting",
+            key=f"lecpath_{i}", placeholder="/Users/you/Lectures/lecture_004.mov",
+            help="Recommended for large recordings — nothing is copied or uploaded. "
+                 "Streamlit only reads the box once you press Enter (or click away).")
+            or "").strip().strip('"').strip("'")
+        f = st.file_uploader(
+            f"…or upload lecture {i + 1}", type=VIDEO_TYPES, key=f"lec_{i}")
+        lecture_files[i] = f
+        if typed:
+            path = os.path.expanduser(typed)
+            if not os.path.isfile(path):
+                st.error(f"Lecture {i + 1}: no file at `{path}`")
+                continue
+            f = _PathFile(path)
+        elif f is not None:
+            with st.spinner(f"Saving lecture {i + 1}…"):
+                path = _persist_upload(f, f"lec_{i}")
+        else:
+            st.caption("Paste a path above and **press Enter** — or upload a file — "
+                       "to get this lecture's coding sheet.")
+            st.divider()
+            continue
+        lecture_paths[i] = path
+        try:
+            with st.spinner(f"Reading lecture {i + 1}…"):
+                duration, indices, scheme, blocks = _lecture_plan(path)
+        except Exception as e:
+            st.error(f"Lecture {i + 1}: could not read this file ({e}). "
+                     f"Is it a video ffmpeg can open?")
+            st.divider()
+            continue
+
+        st.success(f"**{f.name}** · {f.size / 1e9:.2f} GB")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Duration", f"{duration:.1f} min")
+        c2.metric("Sampling", scheme)
+        c3.metric("Windows to code", f"{len(indices)}")
+
+        with st.expander(f"Blocks to watch — Lecture {i + 1}", expanded=False):
+            rows = []
+            for label, first_chunk, last_chunk in blocks:
+                start = first_chunk * WINDOW_SECONDS / 60
+                end = min((last_chunk + 1) * WINDOW_SECONDS / 60, duration)
+                rows.append({"Block": label,
+                             "Minutes": f"{start:g} – {end:g}",
+                             "Chunks": f"{first_chunk}–{last_chunk}"})
+            st.table(pd.DataFrame(rows))
+
+        stem = os.path.splitext(f.name)[0]
+        suggested = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_") or f"lecture_{i + 1}"
+        lecture_ids[i] = st.text_input(
+            f"Lecture ID — Lecture {i + 1}", value=suggested, key=f"lid_{i}",
+            help="Names this lecture's output folder, its rows in every results CSV, "
+                 "and its coding sheet. Must be unique across the run — otherwise "
+                 "results from different lectures overwrite each other.").strip()
+
+        default = ",".join(str(x) for x in indices)
+        edited = st.text_input(
+            f"Windows — Lecture {i + 1}", value=default, key=f"win_{i}",
+            help="Computed from the lecture's duration. Edit only if you coded a "
+                 "different set. Blank = classify the whole lecture.")
+        try:
+            lecture_windows[i] = (sorted({int(w) for w in edited.split(",") if w.strip()})
+                                  or None)
+        except ValueError:
+            st.error(f"Lecture {i + 1}: windows must be comma-separated integers.")
+            lecture_windows[i] = indices
+
+        st.download_button(
+            f"⬇️ Coding sheet — Lecture {i + 1} (.xlsx)",
+            data=_template_bytes(lecture_windows[i] or list(range(
+                math.ceil(duration / (WINDOW_SECONDS / 60)))), duration,
+                f"{lecture_ids[i] or f'lecture_{i + 1}'}_coding.xlsx"),
+            file_name=f"{lecture_ids[i] or f'lecture_{i + 1}'}_coding.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"tpl_{i}",
+        )
+        st.divider()
 
     st.subheader("2 · Manual COPUS Coding — Sofia")
+    st.caption(
+        "Download the sheet above, code each row top to bottom, then upload it here. "
+        "Every row needs at least one code — a blank row is read as \"nothing happened\", "
+        "not \"not coded\"."
+    )
     sofia_files = [
         st.file_uploader(f"Sofia Coding — Lecture {i + 1}", type=["xlsx"], key=f"sofia_{i}")
         for i in range(3)
     ]
 
-    st.subheader("3 · Manual COPUS Coding — Dr. Kaw")
-    kaw_files = [
-        st.file_uploader(f"Dr. Kaw Coding — Lecture {i + 1}", type=["xlsx"], key=f"kaw_{i}")
-        for i in range(3)
-    ]
-
-    st.subheader("4 · Student Survey (optional)")
+    st.subheader("3 · Student Survey (optional)")
     survey_file = st.file_uploader(
         "Student Engagement Survey (SCCCEI/CUCEI) — (optional)", type=["csv"], key="survey"
     )
 
-    # A lecture is runnable only if it has BOTH a video and Sofia's coding.
+    # A lecture is runnable only if it has BOTH a readable video and Sofia's
+    # coding. Keyed on lecture_paths, not the uploader — a lecture given by path
+    # has no uploaded file object.
     runnable = [
         i for i in range(3)
-        if lecture_files[i] is not None and sofia_files[i] is not None
+        if lecture_paths.get(i) and sofia_files[i] is not None
     ]
     can_run = len(runnable) >= 1
 
+    chosen_ids = [lecture_ids.get(i, "") for i in runnable]
+    if len(set(chosen_ids)) != len(chosen_ids):
+        dupes = sorted({x for x in chosen_ids if chosen_ids.count(x) > 1})
+        st.error(f"Lecture IDs must be unique — {dupes} is used more than once. "
+                 f"Two lectures sharing an ID write to the same folder and the "
+                 f"second overwrites the first.")
+        can_run = False
+    if any(not x for x in chosen_ids):
+        st.error("Every lecture needs a non-empty Lecture ID.")
+        can_run = False
+
     if not can_run:
-        st.info("Upload at least **Lecture 1** and its **Sofia coding** to enable the run.")
+        st.info("Add at least **Lecture 1** (path or upload) and its **Sofia coding** "
+                "to enable the run.")
     else:
         skipped = [
             i + 1 for i in range(3)
-            if lecture_files[i] is not None and sofia_files[i] is None
+            if lecture_paths.get(i) and sofia_files[i] is None
         ]
         if skipped:
             st.warning(f"Lecture(s) {skipped} have a video but no Sofia coding — they will be skipped.")
@@ -361,14 +523,11 @@ elif ss.stage == "idle":
 
         lectures = []
         for i in runnable:
-            lid = f"lecture_{i + 1}"
-            lec_path = _save_upload(lecture_files[i], inputs, f"{lid}.mp4")
+            lid = lecture_ids.get(i) or f"lecture_{i + 1}"
+            # Already on disk from the duration probe — don't copy it again.
+            lec_path = lecture_paths[i]
             sofia_path = _save_upload(sofia_files[i], inputs, f"{lid}_sofia.xlsx")
-            kaw_path = (
-                _save_upload(kaw_files[i], inputs, f"{lid}_kaw.xlsx")
-                if kaw_files[i] is not None else None
-            )
-            lectures.append((lec_path, lid, sofia_path, kaw_path))
+            lectures.append((lec_path, lid, sofia_path, lecture_windows.get(i)))
 
         survey_path = (
             _save_upload(survey_file, inputs, "survey.csv") if survey_file else None
@@ -383,11 +542,12 @@ elif ss.stage == "idle":
             "arms_to_run": arms_to_run,
             "primary_arm": primary_arm,
             "max_chunks": int(cap) or None,
+            "model": model,
             "survey": survey_path,
         }
         ss.meta = {
             "professor": professor, "course": course, "semester": semester,
-            "arm": arm, "primary_arm": primary_arm,
+            "arm": arm, "primary_arm": primary_arm, "model": model,
         }
         ss.temp_dir = temp_dir
         ss.output_dir = output_dir
@@ -436,8 +596,6 @@ else:
                 with st.expander(f"{lid_dir} — per-comparison κ"):
                     for label, fn in (
                         ("AI vs Sofia", "kappa_ai_vs_sofia.csv"),
-                        ("AI vs Dr. Kaw", "kappa_ai_vs_kaw.csv"),
-                        ("Sofia vs Dr. Kaw", "kappa_sofia_vs_kaw.csv"),
                     ):
                         fp = os.path.join(ld, fn)
                         if os.path.exists(fp):

@@ -1,6 +1,10 @@
+import math
 import pandas as pd
 import os
 from sklearn.metrics import cohen_kappa_score
+
+# Label for the summary row appended to every kappa table.
+MEAN_ROW_LABEL = "MEAN"
 
 
 def load_human_codes(csv_path):
@@ -22,7 +26,8 @@ def load_human_codes(csv_path):
 def load_ai_codes(csv_path):
     """
     Loads results.csv from the pipeline.
-    Expected columns: lecture_id, window_index, window_start, window_end, arm, copus_codes
+    Expected columns: lecture_id, window_index, window_start, window_end, arm,
+    model, copus_codes
     """
     df = pd.read_csv(csv_path)
     rows = []
@@ -35,17 +40,44 @@ def load_ai_codes(csv_path):
     return rows
 
 
+def mean_kappa(values):
+    """
+    Mean of the numeric kappa values, skipping "N/A" and "ERR:" entries.
+
+    Codes that neither rater used contribute no information and must not drag
+    the average toward zero -- that is the whole point of reporting them as N/A
+    rather than 0.00.
+    """
+    nums = []
+    for v in values:
+        f = pd.to_numeric(v, errors="coerce")
+        if pd.notna(f):
+            nums.append(float(f))
+    if not nums:
+        return "N/A"
+    return round(sum(nums) / len(nums), 3)
+
+
 def kappa_by_code(human_windows, ai_windows):
     """
     Computes Cohen's Kappa per COPUS code given already-loaded window lists
     (each a list of {"window_index", "codes"} dicts). Only compares windows
     present in BOTH sets. Returns a list of dicts:
       {"code", "kappa", "human_positive_windows", "ai_positive_windows"}
-    sorted by code. Kappa is "N/A" when there is no label variation.
+    sorted by code.
+
+    Kappa is "N/A" only when it is mathematically undefined rather than low:
+      - NEITHER rater ever marked the code (no observations at all), or
+      - neither rater varies on the code (e.g. both marked every window).
+
+    A code used by exactly one rater is NOT N/A. cohen_kappa_score returns
+    exactly 0.0 there, and that zero is the correct reading: the two raters
+    agreed on nothing for that code. Reporting it as N/A hides one-sided
+    over-fires (Sofia n=0 vs AI n=11 on AnQ) behind a blank cell.
 
     Window lists may pool multiple lectures; window_index collisions across
     lectures are handled by pairing on position within the shared-index order
-    per (human, ai) pair — callers that pool should pass matching-length,
+    per (human, ai) pair --- callers that pool should pass matching-length,
     aligned lists (see compute_comparison_table).
     """
     human_indices = [w["window_index"] for w in human_windows]
@@ -76,6 +108,7 @@ def kappa_by_code(human_windows, ai_windows):
         pairs.append((w, bucket[pos]))
         ai_cursor[idx] = pos + 1
 
+    n = len(pairs)
     results = []
     for code in sorted(all_codes):
         human_labels = [1 if code in h["codes"] else 0 for h, _ in pairs]
@@ -83,12 +116,30 @@ def kappa_by_code(human_windows, ai_windows):
         human_pos = sum(human_labels)
         ai_pos = sum(ai_labels)
 
-        # Need variation in at least one rater to compute kappa
-        if len(set(human_labels + ai_labels)) < 2:
+        if n == 0:
+            kappa = "N/A"
+        elif human_pos == 0 and ai_pos == 0:
+            # NEITHER rater used this code -- there are no observations at all,
+            # so kappa is genuinely undefined. When only ONE rater is at zero the
+            # code IS defined: sklearn returns 0.0, and that 0.0 is a real
+            # finding (one rater over- or under-fired the code on every window),
+            # not an artifact. Suppressing it hid an 11-window AnQ over-fire.
+            kappa = "N/A"
+        elif len(set(human_labels + ai_labels)) < 2:
+            # No variation in either rater.
             kappa = "N/A"
         else:
+            if human_pos == n or ai_pos == n:
+                # Mirror image of the case above: a rater who marked EVERY
+                # window is also constant, so kappa is depressed by prevalence
+                # rather than by disagreement. Reported, but flagged.
+                print(f"[warn] {code}: a rater marked all {n} windows "
+                      f"(human={human_pos}, ai={ai_pos}); kappa is prevalence-"
+                      f"depressed, not a disagreement measure.")
             try:
-                kappa = round(cohen_kappa_score(human_labels, ai_labels), 3)
+                kappa = cohen_kappa_score(human_labels, ai_labels)
+                # sklearn returns nan when the (1 - pe) denominator is 0.
+                kappa = "N/A" if math.isnan(kappa) else round(kappa, 3)
             except Exception as e:
                 kappa = f"ERR: {e}"
 
@@ -105,14 +156,16 @@ def compute_kappa(csv_a, csv_b, output_dir, output_filename="kappa_results.csv",
                   label_a="A", label_b="B"):
     """
     Computes Cohen's Kappa for each COPUS code comparing two long-format code
-    sets. Works for AI-vs-human OR human-vs-human (e.g. Sofia vs Dr. Kaw): both
-    inputs are read the same way, so any two coding CSVs can be compared.
+    sets. Works for AI-vs-human OR human-vs-human (a second coder, for
+    inter-rater reliability): both inputs are read the same way, so any two
+    coding CSVs can be compared.
     Only compares windows present in BOTH csv_a and csv_b.
 
     output_filename lets callers name each comparison distinctly
     (e.g. kappa_ai_vs_sofia.csv). label_a/label_b customize the printed header.
-    Returns the per-code kappa DataFrame. The 'human_positive_windows' /
-    'ai_positive_windows' columns count positives for csv_a / csv_b respectively.
+    Returns the per-code kappa DataFrame, with a trailing MEAN row averaging the
+    numeric kappas only. The 'human_positive_windows' / 'ai_positive_windows'
+    columns count positives for csv_a / csv_b respectively.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -126,18 +179,28 @@ def compute_kappa(csv_a, csv_b, output_dir, output_filename="kappa_results.csv",
     print(f"Shared windows for comparison: {sorted(a_indices & b_indices)}")
 
     kappa_results = kappa_by_code(a_windows, b_windows)
+    kappa_results.append({
+        "code": MEAN_ROW_LABEL,
+        "kappa": mean_kappa([r["kappa"] for r in kappa_results]),
+        "human_positive_windows": "",
+        "ai_positive_windows": "",
+    })
 
     print(f"\n{'Code':<8} {'Kappa':>8} {label_a + '+':>8} {label_b + '+':>8}")
     print("-" * 38)
     for r in kappa_results:
+        if r["code"] == MEAN_ROW_LABEL:
+            print("-" * 38)
         print(f"{r['code']:<8} {str(r['kappa']):>8} "
-              f"{r['human_positive_windows']:>8} {r['ai_positive_windows']:>8}")
+              f"{str(r['human_positive_windows']):>8} "
+              f"{str(r['ai_positive_windows']):>8}")
+    print("(N/A = kappa undefined: neither rater ever used that code)")
 
     # Save results
     results_df = pd.DataFrame(kappa_results)
     out_path = os.path.join(output_dir, output_filename)
     results_df.to_csv(out_path, index=False)
-    print(f"\nKappa results saved → {out_path}")
+    print(f"\nKappa results saved -> {out_path}")
 
     return results_df
 
@@ -168,7 +231,8 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False)
     output_csv: path for the pooled wide table.
     per_lecture: also write a per-lecture breakdown next to output_csv.
 
-    Raw kappa is computed for every (code x arm) — no support-matrix masking.
+    Raw kappa is computed for every (code x arm) --- no support-matrix masking.
+    A trailing MEAN row averages each arm's numeric kappas.
     """
     lecture_arm_csvs = _normalize_arm_csvs(arm_csvs)
     human_csvs = human_csv if isinstance(human_csv, (list, tuple)) else [human_csv]
@@ -202,14 +266,24 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False)
         return table
 
     def write_wide(table, path, extra=None):
+        codes = sorted(table)
         rows = []
-        for code in sorted(table):
+        for code in codes:
             row = {"code": code}
             if extra:
                 row.update(extra)
             for arm in arms:
                 row[f"{arm}_kappa"] = table[code].get(arm, "N/A")
             rows.append(row)
+        # MEAN row, per arm, over that arm's numeric kappas only.
+        mean_row = {"code": MEAN_ROW_LABEL}
+        if extra:
+            mean_row.update(extra)
+        for arm in arms:
+            mean_row[f"{arm}_kappa"] = mean_kappa(
+                [table[c].get(arm, "N/A") for c in codes]
+            )
+        rows.append(mean_row)
         cols = (["code"] + (list(extra.keys()) if extra else [])
                 + [f"{arm}_kappa" for arm in arms])
         df = pd.DataFrame(rows, columns=cols)
@@ -221,7 +295,7 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False)
     pooled = build_table(lecture_arm_csvs, human_csvs)
     pooled_df = write_wide(pooled, output_csv)
 
-    print(f"\n=== Comparison table (pooled, κ per code × arm) ===")
+    print(f"\n=== Comparison table (pooled, kappa per code x arm) ===")
     header = f"{'Code':<8}" + "".join(f"{a:>18}" for a in arms)
     print(header)
     print("-" * len(header))
@@ -230,7 +304,13 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False)
         for arm in arms:
             line += f"{str(pooled[code].get(arm, 'N/A')):>18}"
         print(line)
-    print(f"\nComparison table saved → {output_csv}")
+    print("-" * len(header))
+    mean_line = f"{MEAN_ROW_LABEL:<8}"
+    for arm in arms:
+        mean_line += f"{str(mean_kappa([pooled[c].get(arm, 'N/A') for c in sorted(pooled)])):>18}"
+    print(mean_line)
+    print("(N/A = kappa undefined: neither rater used that code; excluded from MEAN)")
+    print(f"\nComparison table saved -> {output_csv}")
 
     # Per-lecture breakdown
     if per_lecture and len(lecture_arm_csvs) > 1:
@@ -238,18 +318,25 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False)
         for d, hp in zip(lecture_arm_csvs, human_csvs):
             lid = _lecture_id_from_human_csv(hp)
             table = build_table([d], [hp])
-            for code in sorted(table):
+            codes = sorted(table)
+            for code in codes:
                 row = {"code": code, "lecture_id": lid}
                 for arm in arms:
                     row[f"{arm}_kappa"] = table[code].get(arm, "N/A")
                 by_lecture_rows.append(row)
+            mean_row = {"code": MEAN_ROW_LABEL, "lecture_id": lid}
+            for arm in arms:
+                mean_row[f"{arm}_kappa"] = mean_kappa(
+                    [table[c].get(arm, "N/A") for c in codes]
+                )
+            by_lecture_rows.append(mean_row)
         cols = ["lecture_id", "code"] + [f"{arm}_kappa" for arm in arms]
         by_df = pd.DataFrame(by_lecture_rows, columns=cols)
         by_path = os.path.join(
             os.path.dirname(output_csv) or ".", "comparison_table_by_lecture.csv"
         )
         by_df.to_csv(by_path, index=False)
-        print(f"Per-lecture breakdown saved → {by_path}")
+        print(f"Per-lecture breakdown saved -> {by_path}")
 
     return pooled_df
 

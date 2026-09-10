@@ -1,6 +1,8 @@
 [server]
-# Lecture .mp4 files can be 500MB–2GB; raise Streamlit's 200MB default.
-maxUploadSize = 3000
+# This only governs the *upload* widget. Real lecture recordings run to several
+# GB, and pushing those through the browser is slow and memory-hungry — paste the
+# file's path into the app instead: nothing is copied and there is no ceiling.
+maxUploadSize = 10000
 
 [browser]
 gatherUsageStats = false

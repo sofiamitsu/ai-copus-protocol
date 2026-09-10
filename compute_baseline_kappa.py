@@ -36,36 +36,44 @@ Lec and RtW, which have real support in this lecture.
 
 RUN:
     uv run python compute_baseline_kappa.py
+    uv run python compute_baseline_kappa.py --lecture-id sandel \
+        --results-dir output/sandel/results_multimodal
 """
 
+import argparse
 import os
 
 from aggregate.aggregator import aggregate_results
 from validate.validator import compute_kappa
 
-RESULTS_DIR = "output/pipeline_test/results"
-HUMAN_CSV = "human_coding_lecture_001.csv"
-OUT_DIR = "output/pipeline_test/kappa_full_multimodal"
-AI_CSV = os.path.join(OUT_DIR, "results_full_multimodal.csv")
+DEFAULT_LECTURE_ID = "lecture_001"
+DEFAULT_RESULTS_DIR = "output/pipeline_test/results"
+DEFAULT_OUT_ROOT = "output/pipeline_test/kappa_full_multimodal"
 
 
-def main():
-    if not os.path.isdir(RESULTS_DIR):
-        raise SystemExit(f"Missing {RESULTS_DIR} --- run from the repo root.")
-    if not os.path.isfile(HUMAN_CSV):
-        raise SystemExit(f"Missing {HUMAN_CSV} --- run from the repo root.")
+def main(lecture_id, results_dir, human_csv, out_root):
+    if not os.path.isdir(results_dir):
+        raise SystemExit(f"Missing {results_dir} --- run from the repo root.")
+    if not os.path.isfile(human_csv):
+        raise SystemExit(f"Missing {human_csv} --- run from the repo root.")
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # Scope every output under the lecture id: scoring a second lecture used to
+    # overwrite the first one's CSVs, because both the directory and the
+    # lecture_id stamped into each row were hardcoded to lecture_001.
+    out_dir = os.path.join(out_root, lecture_id)
+    ai_csv = os.path.join(out_dir, f"results_full_multimodal_{lecture_id}.csv")
+    os.makedirs(out_dir, exist_ok=True)
 
-    n_json = len([f for f in os.listdir(RESULTS_DIR) if f.endswith(".json")])
-    print(f"Found {n_json} per-chunk result JSONs in {RESULTS_DIR}\n")
+    n_json = len([f for f in os.listdir(results_dir) if f.endswith(".json")])
+    print(f"Lecture: {lecture_id}")
+    print(f"Found {n_json} per-chunk result JSONs in {results_dir}\n")
 
     # Step 1 --- collapse the per-chunk JSONs into one long-format CSV.
     # Same function run.py uses, so the format matches what compute_kappa expects.
     aggregate_results(
-        chunks_dir=RESULTS_DIR,
-        output_csv=AI_CSV,
-        lecture_id="lecture_001",
+        results_dir=results_dir,
+        output_csv=ai_csv,
+        lecture_id=lecture_id,
         arm="multimodal",
     )
 
@@ -74,22 +82,37 @@ def main():
     # so human MUST be csv_a for the column names to mean what they say.
     print()
     df = compute_kappa(
-        csv_a=HUMAN_CSV,
-        csv_b=AI_CSV,
-        output_dir=OUT_DIR,
-        output_filename="kappa_full_multimodal.csv",
+        csv_a=human_csv,
+        csv_b=ai_csv,
+        output_dir=out_dir,
+        output_filename=f"kappa_full_multimodal_{lecture_id}.csv",
         label_a="Sofia (human)",
         label_b="AI multimodal (gemini-2.5-flash)",
     )
 
     print("\n" + "=" * 60)
-    print("BASELINE KAPPA --- full multimodal run, lecture_001")
+    print(f"BASELINE KAPPA --- full multimodal run, {lecture_id}")
     print("=" * 60)
     print(df.to_string(index=False))
     print()
     print("Judge on rows where human_positive_windows >= 3.")
     print("Log the result in Notion -> Thesis Tracker -> kappa results log.")
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lecture-id", default=DEFAULT_LECTURE_ID)
+    parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
+                        help="Directory of per-chunk result JSONs")
+    parser.add_argument("--human-csv", default=None,
+                        help="Human coding CSV; defaults to human_coding_<lecture-id>.csv")
+    parser.add_argument("--output-dir", default=DEFAULT_OUT_ROOT)
+    args = parser.parse_args()
+
+    main(
+        lecture_id=args.lecture_id,
+        results_dir=args.results_dir,
+        human_csv=args.human_csv or f"human_coding_{args.lecture_id}.csv",
+        out_root=args.output_dir,
+    )
