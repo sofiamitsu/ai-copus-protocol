@@ -5,6 +5,11 @@ Two sources, either or both:
   data/cucei/*.xlsm   one filled CUCEI_Scoring_Tool per professor (preferred --
                       the workbook IS the working file, no CSV to keep in sync)
   data/cucei_scores.csv
+The Streamlit app also accepts one workbook per run as an upload;
+stage_data_dir() stages just that professor's scores for the run.
+
+A report only ever shows its own professor's scores, read against the scale
+midpoint -- never a cross-professor average.
 
 The College and University Classroom Environment Inventory (CUCEI) scores are
 computed OUTSIDE this pipeline and supplied as a finished CSV, one row per
@@ -25,6 +30,7 @@ survey's own R_/N_ labels. The final scores are produced and checked by hand.)
 import glob
 import os
 import re
+import shutil
 import statistics
 
 import pandas as pd
@@ -177,12 +183,41 @@ def load_workbook_scores(path, professor_id=None):
     return pd.DataFrame(rows, columns=REQUIRED_COLUMNS)
 
 
+def _workbook_paths(workbook_dir):
+    return sorted(p for p in glob.glob(os.path.join(workbook_dir, "*.xls[xm]"))
+                  if not os.path.basename(p).startswith("~$"))
+
+
 def load_workbook_dir(workbook_dir=DEFAULT_WORKBOOK_DIR):
     """Every CUCEI workbook in a folder, concatenated. None if there are none."""
-    paths = sorted(p for p in glob.glob(os.path.join(workbook_dir, "*.xls[xm]"))
-                   if not os.path.basename(p).startswith("~$"))
-    frames = [load_workbook_scores(p) for p in paths]
+    frames = [load_workbook_scores(p) for p in _workbook_paths(workbook_dir)]
     return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def stage_data_dir(scores, dest_dir, base_data_dir=_DATA_DIR):
+    """
+    Build a report data dir at dest_dir for one run: this professor's CUCEI
+    scores (a DataFrame from load_workbook_scores, e.g. the Streamlit upload)
+    and nothing else from CUCEI -- no other professor's workbook or CSV row is
+    copied, so the run cannot show or depend on anyone else's scores. golden/
+    (reference-lecture behavior, no CUCEI) is linked from base_data_dir when
+    present. Returns dest_dir.
+
+    Scores are written as CSV rows, so the uploaded file's name does not have to
+    carry the professor number.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    if base_data_dir and os.path.isdir(base_data_dir):
+        golden = os.path.join(base_data_dir, "golden")
+        dest_golden = os.path.join(dest_dir, "golden")
+        if os.path.isdir(golden) and not os.path.exists(dest_golden):
+            try:
+                os.symlink(golden, dest_golden, target_is_directory=True)
+            except OSError:  # e.g. Windows without symlink rights
+                shutil.copytree(golden, dest_golden)
+    scores[REQUIRED_COLUMNS].to_csv(
+        os.path.join(dest_dir, "cucei_scores.csv"), index=False)
+    return dest_dir
 
 
 def load_all(path=DEFAULT_PATH, workbook_dir=DEFAULT_WORKBOOK_DIR):
@@ -244,18 +279,3 @@ def load_scores(professor_id, path=DEFAULT_PATH, workbook_dir=DEFAULT_WORKBOOK_D
         return None
     order = {d: i for i, d in enumerate(DIMENSIONS)}
     return mine.sort_values("dimension", key=lambda s: s.map(order)).reset_index(drop=True)
-
-
-def study_averages(path=DEFAULT_PATH, workbook_dir=DEFAULT_WORKBOOK_DIR):
-    """
-    {dimension: (mean of professors' means, number of professors)} across every
-    professor in the file -- the "study average" a report compares against.
-    Each professor counts once, regardless of class size.
-    """
-    df = load_all(path, workbook_dir)
-    if df is None:
-        return {}
-    out = {}
-    for dim, g in df.dropna(subset=["mean"]).groupby("dimension"):
-        out[dim] = (round(float(g["mean"].mean()), 2), int(g["professor_id"].nunique()))
-    return out

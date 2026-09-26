@@ -13,7 +13,7 @@ import os
 import pandas as pd
 
 from utils.cucei import (
-    DIMENSION_MEANINGS, DIMENSIONS, SCALE_MIDPOINT, load_scores, study_averages,
+    DIMENSION_MEANINGS, DIMENSIONS, SCALE_MIDPOINT, load_scores,
 )
 from utils.professor_ids import load_mapping
 
@@ -130,7 +130,11 @@ def cucei_profile(professor_id, data_dir=DEFAULT_DATA_DIR):
     """
     Rows for the CUCEI section, or None if scores are not available yet.
 
-    Each row: dimension, mean, sd, n, study_avg, n_courses, interpretation.
+    Each row: dimension, mean, sd, n, interpretation.
+
+    Only this professor's own scores are used. Scores are read against the fixed
+    scale midpoint, never against other professors: a report must not reveal,
+    or be shaped by, anyone else's results.
     """
     path = os.path.join(data_dir, "cucei_scores.csv")
     workbooks = os.path.join(data_dir, "cucei")
@@ -139,40 +143,33 @@ def cucei_profile(professor_id, data_dir=DEFAULT_DATA_DIR):
     scores = load_scores(professor_id, path, workbooks)
     if scores is None:
         return None
-    averages = study_averages(path, workbooks)
     rows = []
     for _, r in scores.iterrows():
         dim = r["dimension"]
-        avg, n_courses = averages.get(dim, (None, 0))
         rows.append({
             "dimension": dim,
             "mean": r["mean"],
             "sd": r["sd"],
             "n": int(r["n_respondents"]) if pd.notna(r["n_respondents"]) else None,
-            "study_avg": avg,
-            "n_courses": n_courses,
-            "interpretation": interpret_dimension(dim, r["mean"], avg, n_courses),
+            "interpretation": interpret_dimension(dim, r["mean"]),
         })
     return rows
 
 
-def _comparison(mean, study_avg, n_courses):
-    """(direction, phrase) comparing a score to the study average, or the midpoint."""
-    if study_avg is not None and n_courses >= 2:
-        ref, label = study_avg, f"the study average ({study_avg:.2f}, {n_courses} courses)"
-    else:
-        ref, label = SCALE_MIDPOINT, f"the scale midpoint ({SCALE_MIDPOINT:.1f})"
-    diff = mean - ref
+def _comparison(mean):
+    """(direction, phrase) comparing a score to the scale midpoint."""
+    label = f"the scale midpoint ({SCALE_MIDPOINT:.1f})"
+    diff = mean - SCALE_MIDPOINT
     if abs(diff) < SAME_BAND:
         return "same", f"in line with {label}"
     return ("above", f"above {label}") if diff > 0 else ("below", f"below {label}")
 
 
-def interpret_dimension(dim, mean, study_avg=None, n_courses=0):
+def interpret_dimension(dim, mean):
     """One plain-language line for a CUCEI dimension score."""
     if mean is None or pd.isna(mean):
         return "No complete responses for this dimension."
-    _, phrase = _comparison(float(mean), study_avg, n_courses)
+    _, phrase = _comparison(float(mean))
     meaning = DIMENSION_MEANINGS[dim]
     return f"{meaning[0].upper()}{meaning[1:]} — {phrase}."
 
@@ -215,8 +212,7 @@ def linking_observations(shares, cucei_rows):
     for pct, code in chosen:
         dim, phrase = BEHAVIOR_LINKS[code]
         row = by_dim[dim]
-        direction, cmp_phrase = _comparison(float(row["mean"]), row["study_avg"],
-                                            row["n_courses"])
+        direction, cmp_phrase = _comparison(float(row["mean"]))
         if direction == "above":
             reading = f" This may be part of why students rate {dim} favorably."
         elif direction == "below":
@@ -264,7 +260,7 @@ def cucei_context_lines(cucei_rows):
     for r in cucei_rows or []:
         if r["mean"] is None or pd.isna(r["mean"]):
             continue
-        _, phrase = _comparison(float(r["mean"]), r["study_avg"], r["n_courses"])
+        _, phrase = _comparison(float(r["mean"]))
         lines.append(f"- CUCEI {r['dimension']}: {float(r['mean']):.2f}/4 "
                      f"(n={r['n']}), {phrase}")
     return lines
@@ -283,11 +279,9 @@ def cucei_recommendation(shares, cucei_rows):
     for r in cucei_rows or []:
         if r["dimension"] not in SUGGESTIONS or r["mean"] is None or pd.isna(r["mean"]):
             continue
-        direction, phrase = _comparison(float(r["mean"]), r["study_avg"], r["n_courses"])
+        direction, phrase = _comparison(float(r["mean"]))
         if direction == "below":
-            ref = r["study_avg"] if (r["study_avg"] is not None and r["n_courses"] >= 2) \
-                else SCALE_MIDPOINT
-            below.append((float(r["mean"]) - ref, r, phrase))
+            below.append((float(r["mean"]) - SCALE_MIDPOINT, r, phrase))
     if not below:
         return None
     _, row, phrase = min(below, key=lambda b: b[0])

@@ -29,6 +29,8 @@ import streamlit.components.v1 as components
 
 from classify.classifier import DEFAULT_MODEL, VALID_MODELS
 from validate.validator import SUMMARY_LABELS
+from utils.cucei import load_workbook_scores, professor_id_from_filename, stage_data_dir
+from utils.professor_ids import parse_professor_folder, slug as professor_slug
 from utils.sparse_windows import plan_sparse_windows, probe_duration_minutes, write_template
 from run import (
     ARM_CONFIG,
@@ -127,6 +129,7 @@ class PipelineRunner:
                 model=cfg.get("model", DEFAULT_MODEL),
                 # Derived from the lecture's "PROFESSOR N (...)" folder when the
                 # video is given by path; an upload falls back to a name slug.
+                professor_id=cfg.get("professor_id") or None,
                 professor_name=cfg.get("professor", ""),
                 course_name=cfg.get("course", ""),
             )
@@ -267,7 +270,7 @@ def _zip_output(output_dir):
     return buf.getvalue()
 
 
-def _try_generate_pdf(output_dir, meta):
+def _try_generate_pdf(output_dir, meta, data_dir=None):
     """Phase 9 hook. Returns a PDF path if the report module exists, else None."""
     try:
         from report.faculty_report import generate_report  # built in Phase 9
@@ -275,7 +278,7 @@ def _try_generate_pdf(output_dir, meta):
         return None
     try:
         pdf_path = os.path.join(output_dir, "faculty_feedback_report.pdf")
-        generate_report(output_dir, pdf_path, meta)
+        generate_report(output_dir, pdf_path, meta, data_dir=data_dir)
         return pdf_path
     except Exception as e:
         st.warning(f"PDF generation failed: {e}")
@@ -307,7 +310,7 @@ def reset_run():
     tmp = ss.get("temp_dir")
     if tmp and os.path.isdir(tmp):
         shutil.rmtree(tmp, ignore_errors=True)
-    for k in ("runner", "temp_dir", "output_dir"):
+    for k in ("runner", "temp_dir", "output_dir", "data_dir"):
         ss.pop(k, None)
     ss.stage = "idle"
     ss.logs = ""
@@ -488,11 +491,40 @@ elif ss.stage == "idle":
         for i in range(3)
     ]
 
-    st.subheader("3 · Student Survey (optional)")
+    st.subheader("3 · CUCEI Workbook (optional)")
+    st.caption(
+        "The professor's filled CUCEI_Scoring_Tool workbook — one per professor, "
+        "covering all the lectures above. Its scores go into the Faculty Feedback Report."
+    )
+    cucei_file = st.file_uploader("CUCEI workbook", type=["xlsm", "xlsx"], key="cucei")
+    cucei_scores, cucei_ok = None, True
+    if cucei_file is not None:
+        # The ID links the scores to this run's lectures in the report. Any
+        # consistent value works; prefer the real professor number when there is one.
+        folder_id = next((parse_professor_folder(p)[0] for p in lecture_paths.values()
+                          if parse_professor_folder(p)[0]), None)
+        cucei_pid = (professor_id_from_filename(cucei_file.name) or folder_id
+                     or professor_slug(professor) or "professor")
+        try:
+            cucei_scores = load_workbook_scores(
+                _persist_upload(cucei_file, "cucei"), cucei_pid)
+        except Exception as e:
+            st.error(f"**{cucei_file.name}**: {e}")
+            cucei_ok = False
+        else:
+            n = pd.to_numeric(cucei_scores["n_respondents"], errors="coerce").max()
+            who = f" · {int(n)} respondents" if pd.notna(n) else ""
+            st.success(f"**{cucei_file.name}**{who} · scores match the raw answers")
+            st.dataframe(cucei_scores.drop(columns="professor_id"), hide_index=True,
+                         use_container_width=True)
+            if folder_id and folder_id != cucei_pid:
+                st.warning(f"This workbook is for `{cucei_pid}`, but the lecture "
+                           f"folder says `{folder_id}`. The run will use `{cucei_pid}`.")
+
+    st.subheader("4 · Student Survey (optional)")
     survey_file = st.file_uploader(
         "Other student survey — (optional, generic summary only)", type=["csv"], key="survey",
-        help="Not for CUCEI. CUCEI scores go in data/cucei_scores.csv and appear in "
-             "the Faculty Feedback Report automatically."
+        help="Not for CUCEI — upload the CUCEI workbook in section 3."
     )
 
     # A lecture is runnable only if it has BOTH a readable video and Sofia's
@@ -513,6 +545,10 @@ elif ss.stage == "idle":
         can_run = False
     if any(not x for x in chosen_ids):
         st.error("Every lecture needs a non-empty Lecture ID.")
+        can_run = False
+
+    if not cucei_ok:
+        st.error("Fix or remove the CUCEI workbook above before running.")
         can_run = False
 
     if not can_run:
@@ -544,6 +580,10 @@ elif ss.stage == "idle":
             _save_upload(survey_file, inputs, "survey.csv") if survey_file else None
         )
 
+        data_dir = None
+        if cucei_scores is not None:
+            data_dir = stage_data_dir(cucei_scores, os.path.join(temp_dir, "data"))
+
         arms_to_run = list(ARM_CONFIG) if arm == "all" else [arm]
         primary_arm = "multimodal" if "multimodal" in arms_to_run else arms_to_run[0]
 
@@ -556,6 +596,10 @@ elif ss.stage == "idle":
             "model": model,
             "survey": survey_path,
             "professor": professor,
+            # Stamped on every lecture so the report finds the uploaded scores;
+            # None keeps the usual folder / name-slug resolution.
+            "professor_id": (cucei_scores["professor_id"].iloc[0]
+                             if cucei_scores is not None else None),
             "course": course,
         }
         ss.meta = {
@@ -564,6 +608,7 @@ elif ss.stage == "idle":
         }
         ss.temp_dir = temp_dir
         ss.output_dir = output_dir
+        ss.data_dir = data_dir
         ss.logs = ""
         runner = PipelineRunner(config)
         runner.start()
@@ -642,7 +687,7 @@ else:
         st.subheader("Download")
         c1, c2 = st.columns(2)
         with c1:
-            pdf_path = _try_generate_pdf(output_dir, meta)
+            pdf_path = _try_generate_pdf(output_dir, meta, ss.get("data_dir"))
             if pdf_path and os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
                     st.download_button(
