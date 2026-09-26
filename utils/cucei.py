@@ -5,8 +5,8 @@ Two sources, either or both:
   data/cucei/*.xlsm   one filled CUCEI_Scoring_Tool per professor (preferred --
                       the workbook IS the working file, no CSV to keep in sync)
   data/cucei_scores.csv
-The Streamlit app also accepts workbooks as uploads; stage_data_dir() layers
-them over data/ for that run.
+The Streamlit app also accepts one workbook per run as an upload;
+stage_data_dir() layers it over data/ for that run.
 
 The College and University Classroom Environment Inventory (CUCEI) scores are
 computed OUTSIDE this pipeline and supplied as a finished CSV, one row per
@@ -191,44 +191,33 @@ def load_workbook_dir(workbook_dir=DEFAULT_WORKBOOK_DIR):
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
-def stage_data_dir(workbook_paths, dest_dir, base_data_dir=_DATA_DIR):
+def stage_data_dir(scores, dest_dir, base_data_dir=_DATA_DIR):
     """
-    Build a report data dir at dest_dir from CUCEI workbooks supplied at run time
-    (the Streamlit uploader) plus whatever base_data_dir already holds: golden/,
-    other professors' workbooks, cucei_scores.csv. Returns dest_dir.
+    Build a report data dir at dest_dir for one run: this professor's CUCEI
+    scores (a DataFrame from load_workbook_scores, e.g. the Streamlit upload)
+    plus whatever base_data_dir already holds: golden/, other professors'
+    workbooks, cucei_scores.csv. Returns dest_dir.
 
-    data/ is gitignored, so a deployed app has only the uploads; locally the
-    repo's data/ is layered underneath. An uploaded workbook REPLACES that
-    professor's scores from base_data_dir instead of tripping load_all's
-    duplicate check -- re-uploading a corrected workbook is the normal case.
+    data/ is gitignored, so a deployed app has only the upload; locally the
+    repo's data/ is layered underneath and still supplies the study average.
+    The upload REPLACES that professor's scores from base_data_dir instead of
+    tripping load_all's duplicate check. It is written as CSV rows, so the
+    uploaded file's name does not have to carry the professor number.
     """
-    uploaded = {}
-    for p in workbook_paths:
-        pid = professor_id_from_filename(p)
-        if not pid:
-            raise ValueError(
-                f"{os.path.basename(p)}: cannot tell which professor this is. Name "
-                f"the file with the professor number, e.g. 'CUCEI PROFESSOR 1.xlsm'.")
-        if pid in uploaded:
-            raise ValueError(
-                f"two workbooks for {pid}: {os.path.basename(uploaded[pid])} and "
-                f"{os.path.basename(p)}.")
-        uploaded[pid] = p
-
+    pids = set(scores["professor_id"].astype(str))
     cucei_dir = os.path.join(dest_dir, "cucei")
     os.makedirs(cucei_dir, exist_ok=True)
-    for p in uploaded.values():
-        shutil.copy2(p, cucei_dir)
+    frames = [scores[REQUIRED_COLUMNS]]
     if base_data_dir and os.path.isdir(base_data_dir):
         for p in _workbook_paths(os.path.join(base_data_dir, "cucei")):
-            if professor_id_from_filename(p) not in uploaded:
+            if professor_id_from_filename(p) not in pids:
                 shutil.copy2(p, cucei_dir)
         csv = os.path.join(base_data_dir, "cucei_scores.csv")
         if os.path.exists(csv):
             df = pd.read_csv(csv)
             if "professor_id" in df.columns:
-                df = df[~df["professor_id"].astype(str).str.strip().isin(uploaded)]
-            df.to_csv(os.path.join(dest_dir, "cucei_scores.csv"), index=False)
+                df = df[~df["professor_id"].astype(str).str.strip().isin(pids)]
+            frames.append(df)
         golden = os.path.join(base_data_dir, "golden")
         dest_golden = os.path.join(dest_dir, "golden")
         if os.path.isdir(golden) and not os.path.exists(dest_golden):
@@ -236,6 +225,8 @@ def stage_data_dir(workbook_paths, dest_dir, base_data_dir=_DATA_DIR):
                 os.symlink(golden, dest_golden, target_is_directory=True)
             except OSError:  # e.g. Windows without symlink rights
                 shutil.copytree(golden, dest_golden)
+    pd.concat(frames, ignore_index=True).to_csv(
+        os.path.join(dest_dir, "cucei_scores.csv"), index=False)
     return dest_dir
 
 

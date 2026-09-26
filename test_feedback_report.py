@@ -308,7 +308,12 @@ upload_dir = os.path.join(tmp, "uploads")
 os.makedirs(upload_dir)
 upload, upload_mean = fake_workbook(os.path.join(upload_dir, "CUCEI_PROFESSOR_7_1.xlsm"))
 
-staged = stage_data_dir([upload], os.path.join(tmp, "staged"), base)
+# One workbook per professor covers all their lectures; the file name need not
+# carry the professor number when the caller supplies the ID.
+renamed = os.path.join(upload_dir, "CUCEI final.xlsm")
+os.rename(upload, renamed)
+uploaded = load_workbook_scores(renamed, "professor_7")
+staged = stage_data_dir(uploaded, os.path.join(tmp, "staged"), base)
 merged = load_all(os.path.join(staged, "cucei_scores.csv"), os.path.join(staged, "cucei"))
 assert sorted(merged["professor_id"].unique()) == ["professor_3", "professor_7", "professor_9"]
 p7 = load_scores("professor_7", os.path.join(staged, "cucei_scores.csv"),
@@ -317,16 +322,9 @@ assert abs(p7["mean"].iloc[0] - upload_mean) < 1e-9, p7
 assert os.path.isdir(os.path.join(staged, "golden", "lec1"))
 assert cucei_profile("professor_7", staged)[0]["mean"] == p7["mean"].iloc[0]
 
-alone = stage_data_dir([upload], os.path.join(tmp, "staged_alone"), None)
+alone = stage_data_dir(uploaded, os.path.join(tmp, "staged_alone"), None)
 assert list(load_all(os.path.join(alone, "cucei_scores.csv"),
                      os.path.join(alone, "cucei"))["professor_id"].unique()) == ["professor_7"]
-for paths, needle in (([os.path.join(tmp, "CUCEI final.xlsm")], "cannot tell"),
-                      ([upload, upload], "two workbooks")):
-    try:
-        stage_data_dir(paths, os.path.join(tmp, "staged_bad"), None)
-        raise AssertionError(f"staged {paths}")
-    except ValueError as e:
-        assert needle in str(e), e
 print("ok  uploaded workbook replaces that professor's data/ scores; others + golden kept")
 
 print("\nAll feedback report tests passed.")

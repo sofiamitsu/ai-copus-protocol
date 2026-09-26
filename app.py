@@ -30,6 +30,7 @@ import streamlit.components.v1 as components
 from classify.classifier import DEFAULT_MODEL, VALID_MODELS
 from validate.validator import SUMMARY_LABELS
 from utils.cucei import load_workbook_scores, professor_id_from_filename, stage_data_dir
+from utils.professor_ids import parse_professor_folder, slug as professor_slug
 from utils.sparse_windows import plan_sparse_windows, probe_duration_minutes, write_template
 from run import (
     ARM_CONFIG,
@@ -319,12 +320,6 @@ def reset_run():
 with st.sidebar:
     st.header("Professor Info")
     professor = st.text_input("Professor name", value=ss.meta.get("professor", ""))
-    professor_id = st.text_input(
-        "Professor ID (optional)", value=ss.meta.get("professor_id", ""),
-        placeholder="professor_1",
-        help="Links this run to the professor's CUCEI scores. Leave blank to take it "
-             "from the uploaded CUCEI workbook's name, or from a 'PROFESSOR N' folder "
-             "in the lecture path.").strip()
     course = st.text_input("Course name", placeholder="EGN 3000 - Engineering Analysis",
                            value=ss.meta.get("course", ""))
     semester = st.text_input("Semester", placeholder="Summer 2026",
@@ -498,39 +493,33 @@ elif ss.stage == "idle":
 
     st.subheader("3 · CUCEI Workbook (optional)")
     st.caption(
-        "The filled CUCEI_Scoring_Tool workbook, named with the professor number "
-        "(e.g. `CUCEI PROFESSOR 1.xlsm`). Its scores go into the Faculty Feedback "
-        "Report. Add other professors' workbooks too to get a study average."
+        "The professor's filled CUCEI_Scoring_Tool workbook — one per professor, "
+        "covering all the lectures above. Its scores go into the Faculty Feedback Report."
     )
-    cucei_files = st.file_uploader(
-        "CUCEI workbook(s)", type=["xlsm", "xlsx"], key="cucei",
-        accept_multiple_files=True) or []
-    cucei_ok, cucei_ids = True, []
-    for j, cf in enumerate(cucei_files):
-        pid = professor_id_from_filename(cf.name)
+    cucei_file = st.file_uploader("CUCEI workbook", type=["xlsm", "xlsx"], key="cucei")
+    cucei_scores, cucei_ok = None, True
+    if cucei_file is not None:
+        # The ID links the scores to this run's lectures in the report. Any
+        # consistent value works; prefer the real professor number when there is one.
+        folder_id = next((parse_professor_folder(p)[0] for p in lecture_paths.values()
+                          if parse_professor_folder(p)[0]), None)
+        cucei_pid = (professor_id_from_filename(cucei_file.name) or folder_id
+                     or professor_slug(professor) or "professor")
         try:
-            if pid in cucei_ids:
-                raise ValueError(f"a second workbook for {pid}.")
-            scores = load_workbook_scores(_persist_upload(cf, f"cucei_{j}"), pid)
+            cucei_scores = load_workbook_scores(
+                _persist_upload(cucei_file, "cucei"), cucei_pid)
         except Exception as e:
-            st.error(f"**{cf.name}**: {e}")
+            st.error(f"**{cucei_file.name}**: {e}")
             cucei_ok = False
-            continue
-        cucei_ids.append(pid)
-        with st.expander(f"✅ {cf.name} → {pid}", expanded=len(cucei_files) == 1):
-            st.dataframe(scores.drop(columns="professor_id"), hide_index=True,
+        else:
+            n = pd.to_numeric(cucei_scores["n_respondents"], errors="coerce").max()
+            who = f" · {int(n)} respondents" if pd.notna(n) else ""
+            st.success(f"**{cucei_file.name}**{who} · scores match the raw answers")
+            st.dataframe(cucei_scores.drop(columns="professor_id"), hide_index=True,
                          use_container_width=True)
-
-    # Which professor's CUCEI scores this report shows: the sidebar ID, else the
-    # only uploaded workbook. Otherwise it falls back to the lecture's folder.
-    run_professor_id = professor_id or (cucei_ids[0] if len(cucei_ids) == 1 else "")
-    if cucei_ids and run_professor_id and run_professor_id not in cucei_ids:
-        st.warning(f"Professor ID is `{run_professor_id}`, but the uploaded "
-                   f"workbooks are for {cucei_ids} — this report may show no CUCEI "
-                   f"scores unless data/ has them.")
-    elif len(cucei_ids) > 1 and not professor_id:
-        st.warning("Several CUCEI workbooks uploaded — set **Professor ID** in the "
-                   "sidebar so the report knows which one is this professor's.")
+            if folder_id and folder_id != cucei_pid:
+                st.warning(f"This workbook is for `{cucei_pid}`, but the lecture "
+                           f"folder says `{folder_id}`. The run will use `{cucei_pid}`.")
 
     st.subheader("4 · Student Survey (optional)")
     survey_file = st.file_uploader(
@@ -559,7 +548,7 @@ elif ss.stage == "idle":
         can_run = False
 
     if not cucei_ok:
-        st.error("Fix or remove the CUCEI workbook(s) above before running.")
+        st.error("Fix or remove the CUCEI workbook above before running.")
         can_run = False
 
     if not can_run:
@@ -592,12 +581,8 @@ elif ss.stage == "idle":
         )
 
         data_dir = None
-        if cucei_files:
-            cucei_inputs = os.path.join(inputs, "cucei")
-            wb_paths = [_save_upload(cf, cucei_inputs,
-                                     re.sub(r"[^A-Za-z0-9._ ()-]", "_", cf.name))
-                        for cf in cucei_files]
-            data_dir = stage_data_dir(wb_paths, os.path.join(temp_dir, "data"))
+        if cucei_scores is not None:
+            data_dir = stage_data_dir(cucei_scores, os.path.join(temp_dir, "data"))
 
         arms_to_run = list(ARM_CONFIG) if arm == "all" else [arm]
         primary_arm = "multimodal" if "multimodal" in arms_to_run else arms_to_run[0]
@@ -611,12 +596,14 @@ elif ss.stage == "idle":
             "model": model,
             "survey": survey_path,
             "professor": professor,
-            "professor_id": run_professor_id,
+            # Stamped on every lecture so the report finds the uploaded scores;
+            # None keeps the usual folder / name-slug resolution.
+            "professor_id": (cucei_scores["professor_id"].iloc[0]
+                             if cucei_scores is not None else None),
             "course": course,
         }
         ss.meta = {
-            "professor": professor, "professor_id": professor_id,
-            "course": course, "semester": semester,
+            "professor": professor, "course": course, "semester": semester,
             "arm": arm, "primary_arm": primary_arm, "model": model,
         }
         ss.temp_dir = temp_dir
