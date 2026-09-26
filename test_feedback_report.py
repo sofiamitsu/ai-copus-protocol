@@ -202,4 +202,95 @@ assert "AT MOST ONE" in p and "do not claim that any behavior caused it" in p
 pr._gemini_text = lambda *a, **k: None
 print("ok  Gemini prompt gets each score vs its comparison, capped at one CUCEI-tied rec")
 
+# --- Reading filled CUCEI workbooks straight from data/cucei/ --------------------
+import openpyxl
+from utils.cucei import (
+    load_workbook_dir, load_workbook_scores, professor_id_from_filename,
+)
+
+assert professor_id_from_filename("CUCEI PROFESSOR 1 (1).xlsm") == "professor_1"
+assert professor_id_from_filename("cucei_professor_12.xlsx") == "professor_12"
+assert professor_id_from_filename("CUCEI final.xlsm") is None
+print("ok  professor_id parsed from the workbook filename")
+
+ANSWERS = {  # 2 respondents; every item answered
+    1: ["SA", "A"], 2: ["D", "SD"],
+}
+
+
+def fake_workbook(path, means=None, answers=("SA", "A")):
+    """
+    A minimal stand-in for the scoring tool: Scoring Key, Data Entry (raw answers,
+    no formulas) and Group Summary (plain numbers, as Excel would have cached).
+    `means` overrides Group Summary so a disagreement can be simulated.
+    """
+    wb = openpyxl.Workbook()
+    key = wb.active
+    key.title = "Scoring Key"
+    key.append(["Subscale", "Positive", "Negative"])
+    items = iter(range(1, 50))
+    layout = {}
+    for dim in DIMENSIONS:
+        pos = [next(items) for _ in range(4)]
+        neg = [next(items) for _ in range(3)]
+        layout[dim] = (pos, neg)
+        key.append([dim, ", ".join(map(str, pos)), ", ".join(map(str, neg))])
+
+    de = wb.create_sheet("Data Entry")
+    de.append(["Respondent ID"] + [f"Q{i}" for i in range(1, 50)])
+    for r, a in enumerate(answers, start=1):
+        de.append([f"S{r}"] + [a] * 49)
+
+    # Truth: positives score SA=4/A=3, negatives reverse -> (4*p + 3*n) / 7
+    pos_score = {"SA": 4, "A": 3, "D": 2, "SD": 1}
+    truth = [sum([pos_score[a]] * 4 + [5 - pos_score[a]] * 3) / 7 for a in answers]
+    true_mean = sum(truth) / len(truth)
+
+    gs = wb.create_sheet("Group Summary")
+    gs.append(["CUCEI Group Summary"])
+    gs.append(["Subscale", "Complete N", "Mean", "Std. Dev."])
+    for dim in DIMENSIONS:
+        gs.append([dim, len(answers), (means or {}).get(dim, true_mean), 0.1])
+    wb.save(path)
+    return path, true_mean
+
+
+wb_dir = os.path.join(tmp, "cucei_books")
+os.makedirs(wb_dir)
+good_wb, true_mean = fake_workbook(os.path.join(wb_dir, "CUCEI PROFESSOR 7.xlsm"))
+df_wb = load_workbook_scores(good_wb)
+assert list(df_wb["professor_id"].unique()) == ["professor_7"]
+assert list(df_wb["dimension"]) == DIMENSIONS
+assert abs(df_wb["mean"].iloc[0] - true_mean) < 1e-9
+assert df_wb["n_respondents"].iloc[0] == 2
+print(f"ok  workbook read: 7 dimensions, mean {true_mean:.3f} matches the raw answers")
+
+# Group Summary that disagrees with the sheet's own answers must be refused.
+bad_wb, _ = fake_workbook(os.path.join(tmp, "CUCEI PROFESSOR 8.xlsm"),
+                          means={"Satisfaction": 17.58})
+try:
+    load_workbook_scores(bad_wb)
+    raise AssertionError("accepted a workbook whose Group Summary contradicts its data")
+except ValueError as e:
+    assert "Satisfaction" in str(e) and "Sum / 7" in str(e), e
+print("ok  workbook whose totals disagree with its answers is refused (the 17.58 bug)")
+
+assert load_workbook_dir(os.path.join(tmp, "no_such_dir")) is None
+assert len(load_workbook_dir(wb_dir)) == 7
+print("ok  folder scan: empty folder -> None, one workbook -> 7 rows")
+
+# Workbooks and a CSV are read together; the same professor in both is an error.
+both = os.path.join(tmp, "both")
+os.makedirs(both)
+write_cucei(os.path.join(both, "cucei_scores.csv"), scores("professor_3", [3.0] * 7))
+merged = load_all(os.path.join(both, "cucei_scores.csv"), wb_dir)
+assert sorted(merged["professor_id"].unique()) == ["professor_3", "professor_7"]
+write_cucei(os.path.join(both, "clash.csv"), scores("professor_7", [3.0] * 7))
+try:
+    load_all(os.path.join(both, "clash.csv"), wb_dir)
+    raise AssertionError("accepted professor_7 in both a workbook and a CSV")
+except ValueError as e:
+    assert "duplicate" in str(e), e
+print("ok  workbooks + CSV merge; a professor in both sources is rejected")
+
 print("\nAll feedback report tests passed.")

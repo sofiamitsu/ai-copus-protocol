@@ -133,12 +133,13 @@ def cucei_profile(professor_id, data_dir=DEFAULT_DATA_DIR):
     Each row: dimension, mean, sd, n, study_avg, n_courses, interpretation.
     """
     path = os.path.join(data_dir, "cucei_scores.csv")
+    workbooks = os.path.join(data_dir, "cucei")
     if not professor_id:
         return None
-    scores = load_scores(professor_id, path)
+    scores = load_scores(professor_id, path, workbooks)
     if scores is None:
         return None
-    averages = study_averages(path)
+    averages = study_averages(path, workbooks)
     rows = []
     for _, r in scores.iterrows():
         dim = r["dimension"]
