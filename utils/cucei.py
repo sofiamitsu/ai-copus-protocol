@@ -5,6 +5,8 @@ Two sources, either or both:
   data/cucei/*.xlsm   one filled CUCEI_Scoring_Tool per professor (preferred --
                       the workbook IS the working file, no CSV to keep in sync)
   data/cucei_scores.csv
+The Streamlit app also accepts workbooks as uploads; stage_data_dir() layers
+them over data/ for that run.
 
 The College and University Classroom Environment Inventory (CUCEI) scores are
 computed OUTSIDE this pipeline and supplied as a finished CSV, one row per
@@ -25,6 +27,7 @@ survey's own R_/N_ labels. The final scores are produced and checked by hand.)
 import glob
 import os
 import re
+import shutil
 import statistics
 
 import pandas as pd
@@ -177,12 +180,63 @@ def load_workbook_scores(path, professor_id=None):
     return pd.DataFrame(rows, columns=REQUIRED_COLUMNS)
 
 
+def _workbook_paths(workbook_dir):
+    return sorted(p for p in glob.glob(os.path.join(workbook_dir, "*.xls[xm]"))
+                  if not os.path.basename(p).startswith("~$"))
+
+
 def load_workbook_dir(workbook_dir=DEFAULT_WORKBOOK_DIR):
     """Every CUCEI workbook in a folder, concatenated. None if there are none."""
-    paths = sorted(p for p in glob.glob(os.path.join(workbook_dir, "*.xls[xm]"))
-                   if not os.path.basename(p).startswith("~$"))
-    frames = [load_workbook_scores(p) for p in paths]
+    frames = [load_workbook_scores(p) for p in _workbook_paths(workbook_dir)]
     return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def stage_data_dir(workbook_paths, dest_dir, base_data_dir=_DATA_DIR):
+    """
+    Build a report data dir at dest_dir from CUCEI workbooks supplied at run time
+    (the Streamlit uploader) plus whatever base_data_dir already holds: golden/,
+    other professors' workbooks, cucei_scores.csv. Returns dest_dir.
+
+    data/ is gitignored, so a deployed app has only the uploads; locally the
+    repo's data/ is layered underneath. An uploaded workbook REPLACES that
+    professor's scores from base_data_dir instead of tripping load_all's
+    duplicate check -- re-uploading a corrected workbook is the normal case.
+    """
+    uploaded = {}
+    for p in workbook_paths:
+        pid = professor_id_from_filename(p)
+        if not pid:
+            raise ValueError(
+                f"{os.path.basename(p)}: cannot tell which professor this is. Name "
+                f"the file with the professor number, e.g. 'CUCEI PROFESSOR 1.xlsm'.")
+        if pid in uploaded:
+            raise ValueError(
+                f"two workbooks for {pid}: {os.path.basename(uploaded[pid])} and "
+                f"{os.path.basename(p)}.")
+        uploaded[pid] = p
+
+    cucei_dir = os.path.join(dest_dir, "cucei")
+    os.makedirs(cucei_dir, exist_ok=True)
+    for p in uploaded.values():
+        shutil.copy2(p, cucei_dir)
+    if base_data_dir and os.path.isdir(base_data_dir):
+        for p in _workbook_paths(os.path.join(base_data_dir, "cucei")):
+            if professor_id_from_filename(p) not in uploaded:
+                shutil.copy2(p, cucei_dir)
+        csv = os.path.join(base_data_dir, "cucei_scores.csv")
+        if os.path.exists(csv):
+            df = pd.read_csv(csv)
+            if "professor_id" in df.columns:
+                df = df[~df["professor_id"].astype(str).str.strip().isin(uploaded)]
+            df.to_csv(os.path.join(dest_dir, "cucei_scores.csv"), index=False)
+        golden = os.path.join(base_data_dir, "golden")
+        dest_golden = os.path.join(dest_dir, "golden")
+        if os.path.isdir(golden) and not os.path.exists(dest_golden):
+            try:
+                os.symlink(golden, dest_golden, target_is_directory=True)
+            except OSError:  # e.g. Windows without symlink rights
+                shutil.copytree(golden, dest_golden)
+    return dest_dir
 
 
 def load_all(path=DEFAULT_PATH, workbook_dir=DEFAULT_WORKBOOK_DIR):

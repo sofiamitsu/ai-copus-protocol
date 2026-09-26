@@ -13,12 +13,15 @@ from report.feedback_sections import resolve_identity
 from report.pdf_report import generate_faculty_report, _discover_lectures
 
 
-def generate_report(output_dir, pdf_path, meta):
+def generate_report(output_dir, pdf_path, meta, data_dir=None):
     """
     Build the Faculty Feedback Report PDF from a `run.py` output directory.
 
     `meta` is the dict app.py keeps in `st.session_state.meta`:
         {"professor": ..., "course": ..., "semester": ..., "arm": ..., "primary_arm": ...}
+
+    `data_dir` holds cucei/, cucei_scores.csv and golden/ (default: the repo's
+    data/). The app passes a per-run dir when CUCEI workbooks were uploaded.
     """
     lecture_results = _discover_lectures(output_dir)
     if not lecture_results:
@@ -40,4 +43,5 @@ def generate_report(output_dir, pdf_path, meta):
         kappa_results=kappa_csv if os.path.exists(kappa_csv) else None,
         survey_data=survey_csv if os.path.exists(survey_csv) else None,
         output_path=pdf_path,
+        data_dir=data_dir,
     )
