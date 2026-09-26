@@ -14,7 +14,7 @@ from report.feedback_sections import (
     code_shares, cucei_profile, golden_profile, interpret_dimension,
     linking_observations, resolve_identity,
 )
-from utils.cucei import DIMENSIONS, load_all, load_scores, study_averages
+from utils.cucei import DIMENSIONS, load_all, load_scores
 from utils.professor_ids import upsert_mapping
 
 pr._gemini_text = lambda *a, **k: None  # never call Gemini from a test
@@ -41,9 +41,6 @@ assert load_scores("professor_404", good) is None
 assert list(load_scores("professor_1", good)["dimension"]) == DIMENSIONS
 print("ok  loader: missing file -> None, unknown professor -> None, dimension order kept")
 
-avgs = study_averages(good)
-assert avgs["Involvement"] == (2.5, 2), avgs["Involvement"]
-print("ok  study average = mean of professors' means, each professor once (2.5 over 2)")
 
 for label, rows, needle in [
     ("workbook's broken Mean column", scores("professor_1", [24.57] * 7), "1-4 scale"),
@@ -69,21 +66,29 @@ except ValueError as e:
     assert "missing column" in str(e)
 print("ok  loader rejects a file missing required columns")
 
-# --- Interpretations compare to the study average, or the midpoint for 1 course --
-assert "above the study average (3.00, 3 courses)" in interpret_dimension(
-    "Innovation", 3.5, 3.0, 3)
-assert "in line with" in interpret_dimension("Innovation", 3.05, 3.0, 3)
-assert "above the scale midpoint (2.5)" in interpret_dimension("Innovation", 3.0, 3.0, 1)
-print("ok  interpretation: vs study average with >=2 courses, vs scale midpoint otherwise")
+# --- Interpretations compare only to the scale midpoint --------------------------
+assert "above the scale midpoint (2.5)" in interpret_dimension("Innovation", 3.0)
+assert "below the scale midpoint (2.5)" in interpret_dimension("Innovation", 2.0)
+assert "in line with the scale midpoint" in interpret_dimension("Innovation", 2.55)
+print("ok  interpretation: vs the scale midpoint only")
 
 # --- Linking observations ----------------------------------------------------
 data_dir = os.path.join(tmp, "data")
 os.makedirs(data_dir)
 write_cucei(os.path.join(data_dir, "cucei_scores.csv"),
-            scores("professor_1", [3.8, 2.4, 3.0, 3.0, 3.0, 3.6, 3.0])
-            + scores("professor_2", [3.0] * 7))
+            scores("professor_1", [3.8, 2.2, 3.0, 3.0, 3.0, 3.6, 2.4])
+            + scores("professor_2", [1.0] * 7))
 rows = cucei_profile("professor_1", data_dir)
 assert len(rows) == 7 and rows[0]["n"] == 20
+# Another professor in the same data must not change a word of this report.
+alone_dir = os.path.join(tmp, "data_alone")
+os.makedirs(alone_dir)
+write_cucei(os.path.join(alone_dir, "cucei_scores.csv"),
+            scores("professor_1", [3.8, 2.2, 3.0, 3.0, 3.0, 3.6, 2.4]))
+assert cucei_profile("professor_1", alone_dir) == rows
+assert not any("average" in r["interpretation"] for r in rows)
+assert not any(k in rows[0] for k in ("study_avg", "n_courses"))
+print("ok  CUCEI section uses only this professor's scores; others change nothing")
 
 shares = {"Lec": 95.0, "MG": 18.0, "AnQ": 40.0, "PQ": 30.0, "D/V": 10.0}
 obs = linking_observations(shares, rows)
@@ -91,7 +96,7 @@ assert len(obs) == 3, obs
 assert obs[0].startswith("You answered student questions (AnQ) in 40%"), obs[0]
 assert not any("(PQ)" in o for o in obs), "one observation per CUCEI dimension"
 assert not any("(Lec)" in o for o in obs), "lecturing is a fallback only"
-assert "It may be worth asking students" in obs[0]           # Involvement 2.4 is below
+assert "It may be worth asking students" in obs[0]           # Involvement 2.2 is below
 assert "may be part of why students rate Personalization favorably" in obs[1]
 assert all(" because " not in o and "caused" not in o for o in obs)
 print("ok  linking: most frequent first, one per dimension, Lec skipped, hedged wording")
@@ -166,12 +171,12 @@ from report.feedback_sections import cucei_recommendation
 freq = pr.code_frequency(pd.DataFrame({"copus_codes": ["Lec", "Lec|AnQ", "Lec"]}))
 lo_shares = {"Lec": 100.0, "AnQ": 12.5}
 
-# professor_1 (from above): Involvement 2.4 vs study avg 2.7 -> below; lowest gap.
+# professor_1 (from above): Involvement 2.2 is furthest below the midpoint.
 rec = cucei_recommendation(lo_shares, rows)
-assert rec.startswith("Students rated Involvement 2.40/4, below the study average"), rec
+assert rec.startswith("Students rated Involvement 2.20/4, below the scale midpoint"), rec
 assert "AnQ in 12.5%" in rec and "PQ in 0%" in rec and "Lec" not in rec, rec
 assert "not a diagnosis" in rec
-print("ok  CUCEI rec: lowest below-average dimension, with this professor's own rates")
+print("ok  CUCEI rec: dimension furthest below the midpoint, with this professor's own rates")
 
 fallback = pr.recommendations(freq, 20.0, shares=lo_shares, cucei_rows=rows)
 assert fallback[0] == rec and len(fallback) <= 3, fallback
@@ -197,7 +202,8 @@ captured = {}
 pr._gemini_text = lambda prompt, **k: captured.setdefault("prompt", prompt) and None
 pr.recommendations(freq, 20.0, shares=lo_shares, cucei_rows=rows)
 p = captured["prompt"]
-assert "CUCEI Involvement: 2.40/4 (n=20), below the study average" in p, p
+assert "CUCEI Involvement: 2.20/4 (n=20), below the scale midpoint" in p, p
+assert "average" not in p.split("Student perceptions")[1], p
 assert "AT MOST ONE" in p and "do not claim that any behavior caused it" in p
 pr._gemini_text = lambda *a, **k: None
 print("ok  Gemini prompt gets each score vs its comparison, capped at one CUCEI-tied rec")
@@ -293,38 +299,27 @@ except ValueError as e:
     assert "duplicate" in str(e), e
 print("ok  workbooks + CSV merge; a professor in both sources is rejected")
 
-# --- Streamlit uploads: staged over the repo's data/ for one run ------------------
+# --- Streamlit uploads: staged alone, never mixed with other professors ----------
 from utils.cucei import stage_data_dir
 
 base = os.path.join(tmp, "base_data")
 os.makedirs(os.path.join(base, "cucei"))
-fake_workbook(os.path.join(base, "cucei", "CUCEI PROFESSOR 7 old.xlsm"),
-              answers=("SD", "SD"))
 fake_workbook(os.path.join(base, "cucei", "CUCEI PROFESSOR 9.xlsm"))
-write_cucei(os.path.join(base, "cucei_scores.csv"),
-            scores("professor_3", [3.0] * 7) + scores("professor_7", [3.0] * 7))
+write_cucei(os.path.join(base, "cucei_scores.csv"), scores("professor_3", [3.0] * 7))
 os.makedirs(os.path.join(base, "golden", "lec1"))
 upload_dir = os.path.join(tmp, "uploads")
 os.makedirs(upload_dir)
-upload, upload_mean = fake_workbook(os.path.join(upload_dir, "CUCEI_PROFESSOR_7_1.xlsm"))
+# The file name need not carry the professor number when the caller supplies it.
+upload, upload_mean = fake_workbook(os.path.join(upload_dir, "CUCEI final.xlsm"))
+uploaded = load_workbook_scores(upload, "professor_7")
 
-# One workbook per professor covers all their lectures; the file name need not
-# carry the professor number when the caller supplies the ID.
-renamed = os.path.join(upload_dir, "CUCEI final.xlsm")
-os.rename(upload, renamed)
-uploaded = load_workbook_scores(renamed, "professor_7")
 staged = stage_data_dir(uploaded, os.path.join(tmp, "staged"), base)
 merged = load_all(os.path.join(staged, "cucei_scores.csv"), os.path.join(staged, "cucei"))
-assert sorted(merged["professor_id"].unique()) == ["professor_3", "professor_7", "professor_9"]
-p7 = load_scores("professor_7", os.path.join(staged, "cucei_scores.csv"),
-                 os.path.join(staged, "cucei"))
-assert abs(p7["mean"].iloc[0] - upload_mean) < 1e-9, p7
+assert list(merged["professor_id"].unique()) == ["professor_7"], merged
+assert abs(merged["mean"].iloc[0] - upload_mean) < 1e-9
 assert os.path.isdir(os.path.join(staged, "golden", "lec1"))
-assert cucei_profile("professor_7", staged)[0]["mean"] == p7["mean"].iloc[0]
-
-alone = stage_data_dir(uploaded, os.path.join(tmp, "staged_alone"), None)
-assert list(load_all(os.path.join(alone, "cucei_scores.csv"),
-                     os.path.join(alone, "cucei"))["professor_id"].unique()) == ["professor_7"]
-print("ok  uploaded workbook replaces that professor's data/ scores; others + golden kept")
+assert cucei_profile("professor_7", staged)[0]["mean"] == merged["mean"].iloc[0]
+assert os.path.isdir(os.path.join(stage_data_dir(uploaded, os.path.join(tmp, "s2"), None)))
+print("ok  staged upload holds only that professor's scores (+ golden), none from data/")
 
 print("\nAll feedback report tests passed.")
