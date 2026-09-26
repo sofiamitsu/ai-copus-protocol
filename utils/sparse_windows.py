@@ -16,6 +16,13 @@ Partial chunks at the end of a lecture are INCLUDED rather than truncated, so
 the chunk count is always ceil(duration / window_size) and the final window may
 be shorter than window_size.
 
+Unsampled gaps are BY DESIGN, not dropped data. Chunk indices keep their real
+position in the lecture, so every chunk between blocks is simply absent from
+the human sheet, the results CSVs, and kappa. For a 48-49.99 min lecture (25
+chunks) the blocks are 0-7, 8-15, 17-24 and the only gap is chunk 16 -- the
+"missing window 16" seen in the lecture_001/Mehran runs. Other durations leave
+other gaps (50 min: 8; 60 min: 8-10 and 19-21). See NOTES.md, "Window 16".
+
 Rounding: this module never uses the built-in round(). Python rounds half to
 even -- round(12.5) == 12 but round(13.5) == 14 -- which for a 50-minute lecture
 picks a different middle block than a human reading "round(duration / 4)" would

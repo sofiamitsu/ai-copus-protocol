@@ -44,6 +44,7 @@ import argparse
 import os
 
 from aggregate.aggregator import aggregate_results
+from utils.professor_ids import resolve_professor
 from validate.validator import compute_kappa
 
 DEFAULT_LECTURE_ID = "lecture_001"
@@ -51,7 +52,7 @@ DEFAULT_RESULTS_DIR = "output/pipeline_test/results"
 DEFAULT_OUT_ROOT = "output/pipeline_test/kappa_full_multimodal"
 
 
-def main(lecture_id, results_dir, human_csv, out_root):
+def main(lecture_id, results_dir, human_csv, out_root, professor_id=None):
     if not os.path.isdir(results_dir):
         raise SystemExit(f"Missing {results_dir} --- run from the repo root.")
     if not os.path.isfile(human_csv):
@@ -64,6 +65,7 @@ def main(lecture_id, results_dir, human_csv, out_root):
     ai_csv = os.path.join(out_dir, f"results_full_multimodal_{lecture_id}.csv")
     os.makedirs(out_dir, exist_ok=True)
 
+    professor_id, _ = resolve_professor(results_dir, professor_id)
     n_json = len([f for f in os.listdir(results_dir) if f.endswith(".json")])
     print(f"Lecture: {lecture_id}")
     print(f"Found {n_json} per-chunk result JSONs in {results_dir}\n")
@@ -75,6 +77,7 @@ def main(lecture_id, results_dir, human_csv, out_root):
         output_csv=ai_csv,
         lecture_id=lecture_id,
         arm="multimodal",
+        professor_id=professor_id,
     )
 
     # Step 2 --- score AI against human coding.
@@ -88,6 +91,7 @@ def main(lecture_id, results_dir, human_csv, out_root):
         output_filename=f"kappa_full_multimodal_{lecture_id}.csv",
         label_a="Sofia (human)",
         label_b="AI multimodal (gemini-2.5-flash)",
+        professor_id=professor_id,
     )
 
     print("\n" + "=" * 60)
@@ -108,6 +112,8 @@ if __name__ == "__main__":
     parser.add_argument("--human-csv", default=None,
                         help="Human coding CSV; defaults to human_coding_<lecture-id>.csv")
     parser.add_argument("--output-dir", default=DEFAULT_OUT_ROOT)
+    parser.add_argument("--professor-id", default=None,
+                        help="Default: derived from a 'professor N' folder in --results-dir")
     args = parser.parse_args()
 
     main(
@@ -115,4 +121,5 @@ if __name__ == "__main__":
         results_dir=args.results_dir,
         human_csv=args.human_csv or f"human_coding_{args.lecture_id}.csv",
         out_root=args.output_dir,
+        professor_id=args.professor_id,
     )

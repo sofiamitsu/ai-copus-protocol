@@ -35,18 +35,21 @@ load_dotenv()
 
 from chunk.chunker import chunk_video
 from classify.classifier import DEFAULT_MODEL, VALID_MODELS
-from test_pipeline import ARM_CONFIG, run_arm
+from test_pipeline import ARM_CONFIG, MAX_ATTEMPTS, run_arm
 from validate.convert_copus_sheet import convert
 from validate.validator import (
-    MEAN_ROW_LABEL,
+    AC1_CLEAR_LABEL,
+    KAPPA_CLEAR_LABEL,
+    agreement_by_code,
     compute_kappa,
     compute_comparison_table,
+    count_clearing_observed,
     load_human_codes,
     load_ai_codes,
-    kappa_by_code,
-    mean_kappa,
+    tag_lecture,
 )
 from report.dashboard import generate_dashboard, generate_comparison_dashboard
+from utils.professor_ids import resolve_professor, upsert_mapping
 
 WINDOW_SECONDS = 120
 
@@ -80,14 +83,24 @@ def chunks_missing(chunks_dir, window_indices=None):
 def process_lecture(lecture_path, lecture_id, sofia_xlsx,
                     lecture_dir, arms_to_run, primary_arm,
                     max_chunks, window_seconds,
-                    window_indices=None, model=DEFAULT_MODEL):
+                    window_indices=None, model=DEFAULT_MODEL,
+                    professor_id=None, professor_name="", course_name=""):
     """
     Run the full per-lecture pipeline. Returns a dict describing this lecture's
     outputs (arm CSV, human CSV, chunk/error counts) for professor-level pooling.
+
+    professor_id is derived from the lecture's "professor N" folder unless given
+    explicitly (see utils.professor_ids.resolve_professor), stamped on every
+    output CSV, and recorded in lecture_professor_mapping.csv one level above
+    lecture_dir.
     """
     chunks_dir = os.path.join(lecture_dir, "chunks")
+    professor_id, professor_name = resolve_professor(
+        lecture_path, professor_id, professor_name)
 
-    print(f"\n########## Lecture: {lecture_id} ##########")
+    print(f"\n########## Lecture: {lecture_id} ({professor_id}) ##########")
+    upsert_mapping(os.path.dirname(os.path.abspath(lecture_dir)), lecture_id,
+                   professor_id, professor_name, course_name)
 
     # Which windows this run covers: explicit sparse list, a cap, or all of them.
     if window_indices is not None:
@@ -124,6 +137,7 @@ def process_lecture(lecture_path, lecture_id, sofia_xlsx,
             window_indices=indices,
             window_seconds=window_seconds,
             model=model,
+            professor_id=professor_id,
         )
         arm_csvs[arm_name] = arm_results[arm_name]["csv"]
 
@@ -157,7 +171,7 @@ def process_lecture(lecture_path, lecture_id, sofia_xlsx,
     print("\n=== Validation: AI vs Sofia ===")
     compute_kappa(human_sofia, primary_csv, lecture_dir,
                   output_filename="kappa_ai_vs_sofia.csv",
-                  label_a="Sofia", label_b="AI")
+                  label_a="Sofia", label_b="AI", professor_id=professor_id)
 
     # 6. Per-lecture behavioral timeline (primary arm).
     print("\n=== Dashboard ===")
@@ -172,14 +186,29 @@ def process_lecture(lecture_path, lecture_id, sofia_xlsx,
             arm_csvs=arm_csvs,
             human_csv=human_sofia,
             output_csv=comparison_csv,
+            professor_ids=professor_id,
         )
         generate_comparison_dashboard(
             arm_csvs, comparison_csv,
             os.path.join(lecture_dir, "comparison_dashboard.html"),
         )
 
+    retries = {arm: arm_results[arm]["retries"] for arm in arms_to_run}
+    total_recovered = sum(len(r["recovered"]) for r in retries.values())
+    total_failed = sum(len(r["failed"]) for r in retries.values())
+    if total_recovered or total_failed:
+        print(f"\n=== Retries ({lecture_id}) ===")
+        for arm, r in retries.items():
+            if r["recovered"] or r["failed"]:
+                print(f"  {arm}: {r['retry_attempts']} extra attempt(s); "
+                      f"recovered {sorted(r['recovered'])}; "
+                      f"still failed {r['failed']}")
+
     return {
         "lecture_id": lecture_id,
+        "professor_id": professor_id,
+        "retries": retries,
+        "professor_name": professor_name,
         "primary_csv": primary_csv,
         "human_sofia": human_sofia,
         "processed": processed,
@@ -206,50 +235,61 @@ def _warn_window_mismatch(lecture_id, ai_csv, sofia_csv):
 
 def build_combined_kappa(lecture_infos, output_csv):
     """
-    Pool every lecture's windows and compute one AI-vs-Sofia kappa per code,
-    giving a professor-level reliability table.
+    Pool every lecture's windows and compute AI-vs-Sofia agreement per code
+    (all 12 COPUS instructor codes), giving a professor-level reliability table:
+    prevalence, % agreement, Cohen's kappa and Gwet's AC1, followed by rows
+    counting how many codes clear 0.7 on each -- no unweighted mean.
     """
     ai, sofia = [], []
-    for info in lecture_infos:
-        ai.extend(load_ai_codes(info["primary_csv"]))
-        sofia.extend(load_human_codes(info["human_sofia"]))
+    for k, info in enumerate(lecture_infos):
+        # Keyed per lecture so window 5 of one lecture never pairs with window 5
+        # of another.
+        ai.extend(tag_lecture(load_ai_codes(info["primary_csv"]), k))
+        sofia.extend(tag_lecture(load_human_codes(info["human_sofia"]), k))
 
-    comparisons = {"ai_vs_sofia": kappa_by_code(sofia, ai)}
-    # code -> {comparison: kappa}
-    kappa_by_comp = {
-        comp: {r["code"]: r["kappa"] for r in rows}
-        for comp, rows in comparisons.items()
-    }
-    all_codes = sorted({c for rows in comparisons.values() for c in
-                        (r["code"] for r in rows)})
-
-    kappa_cols = ["ai_vs_sofia_kappa"]
-    rows = []
-    for code in all_codes:
-        rows.append({
-            "code": code,
-            "ai_vs_sofia_kappa": kappa_by_comp.get("ai_vs_sofia", {}).get(code, "N/A"),
-        })
-    # MEAN over each comparison's numeric kappas; N/A codes are excluded, not
-    # counted as 0.00.
-    mean_row = {"code": MEAN_ROW_LABEL}
-    for col in kappa_cols:
-        mean_row[col] = mean_kappa([r[col] for r in rows])
-    rows.append(mean_row)
-    df = pd.DataFrame(rows, columns=["code"] + kappa_cols)
+    stats = agreement_by_code(sofia, ai)
+    prof_id = "|".join(sorted({i["professor_id"] for i in lecture_infos}))
+    cols = ["professor_id", "code", "n_total_windows", "n_human_marked",
+            "n_codes_human_observed", "n_ai_marked", "pct_agreement",
+            "ai_vs_sofia_kappa", "ai_vs_sofia_ac1"]
+    rows = [{
+        "professor_id": prof_id,
+        "code": r["code"],
+        "n_total_windows": r["n_total_windows"],
+        "n_human_marked": r["n_human_marked"],
+        "n_ai_marked": r["n_ai_marked"],
+        "pct_agreement": r["pct_agreement"],
+        "ai_vs_sofia_kappa": r["kappa"],
+        "ai_vs_sofia_ac1": r["ac1"],
+    } for r in stats]
+    # Threshold counts are scored only over codes the human marked at least once
+    # (see validator.observed_rows); n_codes_human_observed is the denominator.
+    kappa_cleared, n_observed = count_clearing_observed(stats, "kappa")
+    ac1_cleared, _ = count_clearing_observed(stats, "ac1")
+    rows.append({"professor_id": prof_id, "code": KAPPA_CLEAR_LABEL,
+                 "n_codes_human_observed": n_observed,
+                 "ai_vs_sofia_kappa": kappa_cleared})
+    rows.append({"professor_id": prof_id, "code": AC1_CLEAR_LABEL,
+                 "n_codes_human_observed": n_observed,
+                 "ai_vs_sofia_ac1": ac1_cleared})
+    df = pd.DataFrame(rows, columns=cols)
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     df.to_csv(output_csv, index=False)
 
-    print("\n=== Combined kappa (pooled across lectures) ===")
-    header = f"{'Code':<8}{'AI-Sofia':>12}"
+    n = stats[0]["n_total_windows"] if stats else 0
+    print(f"\n=== Combined agreement (pooled across lectures, {n} windows) ===")
+    header = f"{'Code':<8}{'Human+':>8}{'AI+':>6}{'Agree%':>8}{'kappa':>8}{'AC1':>8}"
     print(header)
     print("-" * len(header))
-    for r in rows:
-        if r["code"] == MEAN_ROW_LABEL:
-            print("-" * len(header))
-        print(f"{r['code']:<8}{str(r['ai_vs_sofia_kappa']):>12}")
-    print("(N/A = kappa undefined: a rater never used that code; excluded from MEAN)")
-    print(f"\nCombined kappa saved → {output_csv}")
+    for r in stats:
+        print(f"{r['code']:<8}{r['n_human_marked']:>8}{r['n_ai_marked']:>6}"
+              f"{str(r['pct_agreement']):>8}{str(r['kappa']):>8}{str(r['ac1']):>8}")
+    print("-" * len(header))
+    print(f"Codes clearing 0.7: kappa {kappa_cleared}/{n_observed}, "
+          f"AC1 {ac1_cleared}/{n_observed}  "
+          f"(of the {n_observed} code(s) the human marked at least once)")
+    print("(N/A = undefined: neither rater used the code; never clears 0.7)")
+    print(f"\nCombined agreement saved → {output_csv}")
     return df
 
 
@@ -329,6 +369,10 @@ def analyze_survey(survey_csv, output_csv):
 def main():
     parser = argparse.ArgumentParser(description="Phase 7 professor-bundle runner")
     parser.add_argument("--professor", required=True, help="Professor name (label only)")
+    parser.add_argument("--professor-id", default=None,
+                        help="e.g. professor_1. Default: derived from the lectures' "
+                             "'PROFESSOR N (...)' folder")
+    parser.add_argument("--course", default="", help="Course name, for the report")
     parser.add_argument("--lectures", nargs="+", required=True, help="Lecture .mp4 paths")
     parser.add_argument("--lecture-ids", nargs="+", required=True,
                         help="Lecture ids, aligned with --lectures")
@@ -404,6 +448,9 @@ def main():
             window_seconds=args.window_seconds,
             window_indices=window_indices,
             model=args.model,
+            professor_id=args.professor_id,
+            professor_name=args.professor,
+            course_name=args.course,
         )
         lecture_infos.append(info)
 
@@ -437,6 +484,21 @@ def main():
     print(f"Windows processed: {total_processed}/{total_attempted} "
           f"(primary arm: {primary_arm})")
     print(f"Failed/skipped windows: {total_errors}")
+
+    # Retry statistics, per arm, across every lecture. A window that stays failed
+    # after MAX_ATTEMPTS is dropped from EVERY arm's comparison table, so these
+    # counts belong in the methods write-up, not just the console.
+    print(f"\nRetries (up to {MAX_ATTEMPTS} attempts per window per arm):")
+    for arm in arms_to_run:
+        extra = sum(i["retries"][arm]["retry_attempts"] for i in lecture_infos)
+        recovered = sum(len(i["retries"][arm]["recovered"]) for i in lecture_infos)
+        still = sorted((i["lecture_id"], w) for i in lecture_infos
+                       for w in i["retries"][arm]["failed"])
+        line = (f"  {arm:16} {extra} extra attempt(s), {recovered} window(s) "
+                f"recovered, {len(still)} still failed")
+        if still:
+            line += f": {still}"
+        print(line)
     for info in lecture_infos:
         line = (f"  {info['lecture_id']}: {info['processed']}/{info['attempted']} "
                 f"windows, {info['errors']} errors")

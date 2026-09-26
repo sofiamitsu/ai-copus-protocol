@@ -19,6 +19,30 @@ TRANSCRIBE_MODEL = "gemini-2.5-flash"
 # Override with GEMINI_TIMEOUT_SECONDS if a long chunk legitimately needs more.
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "300"))
 
+# Decoding is pinned so a rerun of the same chunk gives the same codes.
+#
+# At the API default (temperature 1.0) Gemini samples, and borderline windows
+# flip between runs: two 4-arm runs of the SAME lecture, same model, same human
+# coding disagreed on 14 of 24 multimodal windows, moving Lec kappa between 0.00
+# and 1.00. That is run-to-run noise landing on top of the ablation's effect.
+# Temperature 0 takes the most likely token instead of sampling; the seed pins
+# what sampling remains. Neither is a bit-for-bit guarantee from the API, but
+# together they make the run reproducible enough to report.
+#
+# Changing either INVALIDATES cached per-chunk JSONs: run_arm() skips any chunk
+# that already has one, so delete the results_* dirs of any run whose numbers
+# you intend to use.
+GENERATION_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "0"))
+GENERATION_SEED = int(os.environ.get("GEMINI_SEED", "20260922"))
+
+
+def generation_config():
+    """Decoding settings shared by every classification and transcription call."""
+    return types.GenerateContentConfig(
+        temperature=GENERATION_TEMPERATURE,
+        seed=GENERATION_SEED,
+    )
+
 
 def get_gemini_client():
     """
@@ -38,7 +62,8 @@ def get_gemini_client():
 def _call_gemini_and_parse(client, contents, chunk_index, output_dir=None,
                             window_start=None, window_end=None,
                             model=DEFAULT_MODEL, extra_metadata=None):
-    response = client.models.generate_content(model=model, contents=contents)
+    response = client.models.generate_content(
+        model=model, contents=contents, config=generation_config())
 
     # Clean the response (strip markdown code fences if present)
     raw = response.text.strip()
@@ -56,8 +81,12 @@ def _call_gemini_and_parse(client, contents, chunk_index, output_dir=None,
     result["chunk_index"] = chunk_index
     result["window_start"] = window_start
     result["window_end"] = window_end
-    # Stamp the model so every result is traceable to what produced it.
+    # Stamp the model and decoding settings so every result is traceable to what
+    # produced it -- a JSON from a sampled (temperature 1.0) run is not
+    # comparable with one from the pinned runs.
     result["model"] = model
+    result["temperature"] = GENERATION_TEMPERATURE
+    result["seed"] = GENERATION_SEED
     if extra_metadata:
         result.update(extra_metadata)
 
@@ -114,15 +143,20 @@ ONLY if there is substantial content presentation ALONGSIDE the dialogue, not \
 merely when the instructor speaks to facilitate, acknowledge student answers, \
 or transition between questions.
 
-**RtW -- Real-time writing.** Instructor is VISIBLY writing, in real time, on a \
-board, document camera, or tablet. The writing must be actively happening.
+**RtW -- Real-time writing.** Instructor is VISIBLY producing new text, code, or \
+marks in real time on a live authoring surface: whiteboard, chalkboard, document \
+camera, tablet, code editor, terminal, IDE, or any surface where content is being \
+created keystroke-by-keystroke or stroke-by-stroke. The production must be actively \
+happening in this window.
 - Do NOT mark for: pointing at pre-written slides, gesturing at projected content, \
-holding a marker without writing, or advancing slides.
+holding a marker or hovering over a keyboard without producing, or advancing slides.
+- Do NOT mark for showing pre-written code, terminal output that already exists on \
+screen, or static content -- that is Lec (if the instructor is explaining it) or \
+nothing at all.
 
 **FUp -- Follow-up/feedback.** Instructor gives feedback to the whole class on a \
 question or activity the students just did (reviewing answers, discussing what \
-groups found, reformulating or evaluating a student's response for the class \
-before moving on).
+groups found).
 - Do NOT mark for ordinary lecturing that references earlier material.
 
 **PQ -- Posing a question.** Instructor asks the class a non-clicker question \
@@ -166,10 +200,20 @@ audience while lecturing, or any movement while students are only listening.
 one small group, not addressing the whole class.
 - Do NOT mark for a brief exchange that the whole class is attending to -- that is AnQ.
 
-**D/V -- Demo/video.** Instructor is running a physical demonstration, experiment, \
-simulation, video, or animation.
+**D/V -- Demo/video.** Instructor is actively running (executing, playing, or \
+manipulating in real time) a physical demonstration, experiment, simulation, video, \
+or animation. There must be OBSERVABLE MOTION OR CHANGE unfolding on screen or in \
+the room as the demonstration, not just static visual content.
 - Do NOT mark for: static slides, figures, diagrams, equations, or photos on slides. \
 A slide is not a demo.
+- Do NOT mark for static code on screen, terminal output that has already displayed, \
+or a program's results shown as text -- that is Lec (if the instructor is explaining \
+it) or nothing.
+- Do NOT mark for a code editor, IDE, or terminal being visible while the instructor \
+lectures or writes -- the presence of a coding environment alone is not a demo. \
+D/V requires the instructor to be running/executing something with observable output \
+changing on screen in real time (e.g., a program producing animated visualization, \
+a running simulation whose state is visibly evolving).
 
 **Adm -- Administration.** Assigning homework, discussing exams/logistics, returning \
 tests, announcements about the course, including recommendations to purchase \
@@ -280,6 +324,7 @@ def classify_chunk_transcript_only(audio_path, chunk_index, output_dir=None,
     transcribe_response = client.models.generate_content(
         model=TRANSCRIBE_MODEL,
         contents=transcribe_contents,
+        config=generation_config(),
     )
     raw_transcript = transcribe_response.text.strip()
 

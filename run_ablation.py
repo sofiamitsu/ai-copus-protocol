@@ -30,21 +30,24 @@ load_dotenv()
 from chunk.chunker import chunk_video
 from classify.classifier import DEFAULT_MODEL, VALID_MODELS
 from run import chunks_missing
-from test_pipeline import ARM_CONFIG, run_arm
+from test_pipeline import ARM_CONFIG, MAX_ATTEMPTS, run_arm
 from validate.validator import compute_comparison_table, load_human_codes
 from report.dashboard import generate_comparison_dashboard
+from utils.professor_ids import resolve_professor, upsert_mapping
 
 
 def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_seconds,
-                    window_indices=None, model=DEFAULT_MODEL):
+                    window_indices=None, model=DEFAULT_MODEL, professor_id=None):
     """
     Chunk + run all 4 arms for one lecture, on identical chunk indices.
-    Returns ({arm: results_csv}, indices_processed).
+    Returns ({arm: results_csv}, indices_processed, professor_id).
     """
     lecture_dir = os.path.join(output_dir, lecture_id)
     chunks_dir = os.path.join(lecture_dir, "chunks")
+    professor_id, professor_name = resolve_professor(lecture_path, professor_id)
 
-    print(f"\n########## Lecture: {lecture_id} ##########")
+    print(f"\n########## Lecture: {lecture_id} ({professor_id}) ##########")
+    upsert_mapping(output_dir, lecture_id, professor_id, professor_name)
 
     if window_indices is not None:
         indices = sorted(set(window_indices))
@@ -66,6 +69,7 @@ def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_sec
         )
 
     arm_csvs = {}
+    retries = {}
     processed_indices = None
     for arm_name in ARM_CONFIG:
         result = run_arm(
@@ -77,8 +81,10 @@ def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_sec
             window_indices=indices,
             window_seconds=window_seconds,
             model=model,
+            professor_id=professor_id,
         )
         arm_csvs[arm_name] = result["csv"]
+        retries[arm_name] = result["retries"]
         # Every arm must cover the same windows or the κ columns aren't comparable.
         if processed_indices is None:
             processed_indices = result["indices"]
@@ -88,7 +94,7 @@ def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_sec
         if result["failed"]:
             print(f"[warn] arm {arm_name}: failed chunks {result['failed']}")
 
-    return arm_csvs, (processed_indices or [])
+    return arm_csvs, (processed_indices or []), professor_id, retries
 
 
 def main():
@@ -98,6 +104,10 @@ def main():
     parser.add_argument("--lecture-ids", nargs="+", required=True,
                         help="Lecture ids, aligned with --lectures")
     parser.add_argument("--output-dir", default="output/ablation_study")
+    parser.add_argument("--professor-ids", nargs="+", default=None,
+                        help="professor_id per lecture, aligned with --lectures. "
+                             "Default: derived from each lecture's 'PROFESSOR N (...)' "
+                             "folder")
     parser.add_argument("--human-dir", default=".",
                         help="Dir holding human_coding_{id}.csv files")
     parser.add_argument("--max-chunks", type=int, default=None,
@@ -119,6 +129,11 @@ def main():
     if args.windows is not None and args.max_chunks is not None:
         parser.error("--windows and --max-chunks are mutually exclusive; "
                      "--windows already names exactly which chunks to process.")
+    if args.professor_ids is not None and len(args.professor_ids) != len(args.lectures):
+        parser.error(
+            f"--professor-ids ({len(args.professor_ids)}) and --lectures "
+            f"({len(args.lectures)}) must have the same length"
+        )
 
     window_indices = None
     if args.windows is not None:
@@ -141,18 +156,25 @@ def main():
 
     per_lecture_arm_csvs = {}
     per_lecture_indices = {}
-    for lecture_path, lecture_id in zip(args.lectures, args.lecture_ids):
-        arm_csvs, indices = process_lecture(
+    per_lecture_prof = {}
+    per_lecture_retries = {}
+    prof_ids = args.professor_ids or [None] * len(args.lectures)
+    for lecture_path, lecture_id, prof_id in zip(args.lectures, args.lecture_ids, prof_ids):
+        arm_csvs, indices, prof_id, retries = process_lecture(
             lecture_path, lecture_id, args.output_dir,
             args.max_chunks, args.window_seconds,
             window_indices=window_indices, model=args.model,
+            professor_id=prof_id,
         )
         per_lecture_arm_csvs[lecture_id] = arm_csvs
         per_lecture_indices[lecture_id] = indices
+        per_lecture_prof[lecture_id] = prof_id
+        per_lecture_retries[lecture_id] = retries
 
     # Validation — only for lectures whose human coding exists.
     validatable = []
     human_paths = []
+    validated_prof_ids = []
     for lecture_id, arm_csvs in per_lecture_arm_csvs.items():
         human_csv = os.path.join(args.human_dir, f"human_coding_{lecture_id}.csv")
         if os.path.exists(human_csv):
@@ -178,6 +200,7 @@ def main():
                       f"and not just uncoded rows.")
             validatable.append((lecture_id, arm_csvs))
             human_paths.append(human_csv)
+            validated_prof_ids.append(per_lecture_prof[lecture_id])
         else:
             print(f"\n[skip validation] no human coding at {human_csv}")
 
@@ -192,6 +215,7 @@ def main():
         human_csv=human_paths,
         output_csv=os.path.join(args.output_dir, "comparison_table.csv"),
         per_lecture=True,
+        professor_ids=validated_prof_ids,
     )
 
     # One comparison dashboard per lecture (timelines are per-lecture);
@@ -203,6 +227,17 @@ def main():
         )
         generate_comparison_dashboard(arm_csvs, comparison_csv, out_html)
 
+    print(f"\nRetries (up to {MAX_ATTEMPTS} attempts per window per arm):")
+    for arm in ARM_CONFIG:
+        extra = sum(r[arm]["retry_attempts"] for r in per_lecture_retries.values())
+        recovered = sum(len(r[arm]["recovered"]) for r in per_lecture_retries.values())
+        still = sorted((lid, w) for lid, r in per_lecture_retries.items()
+                       for w in r[arm]["failed"])
+        line = (f"  {arm:16} {extra} extra attempt(s), {recovered} window(s) "
+                f"recovered, {len(still)} still failed")
+        if still:
+            line += f": {still}"
+        print(line)
     print(f"\nAblation study complete. Model: {args.model}")
 
 

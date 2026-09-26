@@ -3,6 +3,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 
+from validate.validator import MEAN_ROW_LABEL, SUMMARY_LABELS
+
+# Non-code rows a comparison table may end with (MEAN on pre-AC1 tables).
+SUMMARY_ROW_LABELS = set(SUMMARY_LABELS) | {MEAN_ROW_LABEL}
+
 # COPUS code colors — each code gets a distinct color
 CODE_COLORS = {
     "Lec": "#4C72B0",
@@ -131,6 +136,8 @@ def generate_comparison_dashboard(arm_csvs, comparison_table_csv, output_html):
             continue
         codes, vals = [], []
         for _, r in table.iterrows():
+            if r["code"] in SUMMARY_ROW_LABELS:
+                continue  # threshold-count rows, not per-code kappas
             v = pd.to_numeric(r[col], errors="coerce")
             if pd.notna(v):
                 codes.append(r["code"])

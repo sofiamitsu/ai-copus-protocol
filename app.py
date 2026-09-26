@@ -28,6 +28,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from classify.classifier import DEFAULT_MODEL, VALID_MODELS
+from validate.validator import SUMMARY_LABELS
 from utils.sparse_windows import plan_sparse_windows, probe_duration_minutes, write_template
 from run import (
     ARM_CONFIG,
@@ -38,7 +39,7 @@ from run import (
 )
 
 WINDOW_SECONDS = 120
-KAPPA_COLS = ["ai_vs_sofia_kappa"]
+KAPPA_COLS = ["ai_vs_sofia_kappa", "ai_vs_sofia_ac1"]
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +125,10 @@ class PipelineRunner:
                 window_seconds=WINDOW_SECONDS,
                 window_indices=windows,
                 model=cfg.get("model", DEFAULT_MODEL),
+                # Derived from the lecture's "PROFESSOR N (...)" folder when the
+                # video is given by path; an upload falls back to a name slug.
+                professor_name=cfg.get("professor", ""),
+                course_name=cfg.get("course", ""),
             )
             lecture_infos.append(info)
 
@@ -240,7 +245,11 @@ def _style_kappa(df):
         return "background-color: #f5b7b1; color: #7b241c"
 
     cols = [c for c in KAPPA_COLS if c in df.columns]
-    return df.style.applymap(color, subset=cols).format(na_rep="N/A", subset=cols)
+    # Only per-code rows are agreement values; the trailing codes_clearing_* rows
+    # are counts and must not be colored as if 3 were a kappa of 3.
+    code_rows = df.index[~df["code"].isin(SUMMARY_LABELS)]
+    return (df.style.applymap(color, subset=(code_rows, cols))
+            .format(na_rep="N/A", subset=cols))
 
 
 def _zip_output(output_dir):
@@ -481,7 +490,9 @@ elif ss.stage == "idle":
 
     st.subheader("3 · Student Survey (optional)")
     survey_file = st.file_uploader(
-        "Student Engagement Survey (SCCCEI/CUCEI) — (optional)", type=["csv"], key="survey"
+        "Other student survey — (optional, generic summary only)", type=["csv"], key="survey",
+        help="Not for CUCEI. CUCEI scores go in data/cucei_scores.csv and appear in "
+             "the Faculty Feedback Report automatically."
     )
 
     # A lecture is runnable only if it has BOTH a readable video and Sofia's
@@ -544,6 +555,8 @@ elif ss.stage == "idle":
             "max_chunks": int(cap) or None,
             "model": model,
             "survey": survey_path,
+            "professor": professor,
+            "course": course,
         }
         ss.meta = {
             "professor": professor, "course": course, "semester": semester,
@@ -584,7 +597,7 @@ else:
                 df = pd.read_csv(combined)
                 st.markdown("**Combined (pooled across lectures)**")
                 st.dataframe(_style_kappa(df), use_container_width=True)
-                st.caption("🟩 κ ≥ 0.7  ·  🟨 0.5–0.7  ·  🟥 < 0.5  ·  ⬜ N/A (no label variation)")
+                st.caption("🟩 κ / AC1 ≥ 0.7  ·  🟨 0.5–0.7  ·  🟥 < 0.5  ·  ⬜ N/A (no label variation)")
             else:
                 st.info("No combined κ table found.")
 

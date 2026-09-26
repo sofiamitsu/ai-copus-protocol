@@ -26,7 +26,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak,
+    KeepTogether, SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak,
 )
 
 from report.dashboard import add_timeline_traces, CODE_COLORS
@@ -53,7 +53,19 @@ ACTIVE_LEARNING_CODES = {"FUp", "PQ", "CQ", "AnQ", "MG", "1o1", "D/V"}
 # Passive / transmission-style codes (the rest that count as "teaching time").
 PASSIVE_CODES = {"Lec", "RtW", "Adm", "W"}
 
-from validate.validator import MEAN_ROW_LABEL, mean_kappa
+from validate.convert_copus_sheet import INSTRUCTOR_CODES
+from validate.validator import (
+    AC1_CLEAR_LABEL, KAPPA_CLEAR_LABEL, MEAN_ROW_LABEL, SUMMARY_LABELS, mean_kappa,
+)
+from report.feedback_sections import (
+    DEFAULT_DATA_DIR, code_shares, cucei_context_lines, cucei_profile,
+    cucei_recommendation, golden_profile, linking_observations,
+)
+
+# Golden-comparison chart: the report's navy for the professor, a muted gold for
+# the reference lectures.
+PROFESSOR_COLOR = "#003366"
+GOLDEN_COLOR = "#C9A227"
 
 # Reliability bands for Cohen's kappa (Landis & Koch).
 KAPPA_BANDS = [
@@ -159,6 +171,8 @@ def load_kappa_dict(kappa_results):
                 r["code"]: ("N/A" if str(r[col]).strip() in ("", "N/A", "nan")
                             else r[col])
                 for _, r in df.iterrows()
+                # Threshold-count rows are counts of codes, not kappas.
+                if r["code"] not in SUMMARY_LABELS
             }
     return out
 
@@ -301,10 +315,15 @@ def _fallback_recommendations(overall_freq, overall_active_pct):
     return recs
 
 
-def recommendations(overall_freq, overall_active_pct, survey_summary=None):
+def recommendations(overall_freq, overall_active_pct, survey_summary=None,
+                    shares=None, cucei_rows=None):
     """
     2–3 constructive, framed-as-suggestion recommendations across all lectures.
     Returns a list of strings. Gemini first, deterministic fallback otherwise.
+
+    With CUCEI scores (cucei_rows), Gemini is shown each score against its
+    comparison point and may tie one recommendation to the lowest-rated
+    dimension; the fallback leads with cucei_recommendation() instead.
     """
     freq_lines = "\n".join(
         f"- {r['code']} ({CODE_MEANINGS.get(r['code'], r['code'])}): "
@@ -322,11 +341,29 @@ def recommendations(overall_freq, overall_active_pct, survey_summary=None):
     )
     if survey_summary:
         prompt += f"\nStudent survey context:\n{survey_summary}\n"
+    cucei_lines = cucei_context_lines(cucei_rows)
+    if cucei_lines:
+        prompt += (
+            "\nStudent perceptions (CUCEI, 1-4 scale, higher is more favorable):\n"
+            + "\n".join(cucei_lines) + "\n"
+            "If any dimension is below its comparison point, you may tie AT MOST ONE "
+            "recommendation to the lowest such dimension, naming a concrete, "
+            "observable instructor behavior. Describe the score as students' "
+            "perception of the course; do not claim that any behavior caused it.\n")
+
+    cucei_rec = cucei_recommendation(shares or {}, cucei_rows)
+
+    def fallback():
+        recs = _fallback_recommendations(overall_freq, overall_active_pct)
+        # The CUCEI-grounded suggestion leads: it is the only one built from
+        # this professor's own students' responses.
+        return ([cucei_rec] + recs)[:3] if cucei_rec else recs
+
     text = _gemini_text(prompt)
     if not text:
-        return _fallback_recommendations(overall_freq, overall_active_pct)
+        return fallback()
     recs = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
-    return recs or _fallback_recommendations(overall_freq, overall_active_pct)
+    return recs or fallback()
 
 
 def _survey_summary_text(survey_data):
@@ -458,8 +495,122 @@ def _legend_flowable(styles):
     bits = []
     for _, label, color in KAPPA_BANDS[:-1]:
         bits.append(f'<font color="#{color.hexval()[2:]}">■ {label}</font>')
-    return Paragraph("Reliability bands (Cohen's κ): " + "  ".join(bits),
+    return Paragraph("Reliability bands (κ and AC1): " + "  ".join(bits),
                      styles["Normal"])
+
+
+def render_golden_png(prof_shares, golden_shares, png_path, width=760, height=380):
+    """
+    Grouped horizontal bars: % of windows per COPUS code, this professor vs the
+    golden aggregate. Codes appear in protocol order; a code shows when either
+    profile used it.
+    """
+    codes = [c for c in INSTRUCTOR_CODES
+             if prof_shares.get(c, 0) > 0 or golden_shares.get(c, 0) > 0]
+    codes = list(reversed(codes))  # plotly draws the first category at the bottom
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=codes, x=[golden_shares.get(c, 0) for c in codes], orientation="h",
+        name="Golden reference", marker_color=GOLDEN_COLOR,
+        text=[f"{golden_shares.get(c, 0):g}%" for c in codes], textposition="outside"))
+    fig.add_trace(go.Bar(
+        y=codes, x=[prof_shares.get(c, 0) for c in codes], orientation="h",
+        name="Your lectures", marker_color=PROFESSOR_COLOR,
+        text=[f"{prof_shares.get(c, 0):g}%" for c in codes], textposition="outside"))
+    fig.update_layout(
+        barmode="group", plot_bgcolor="white",
+        xaxis=dict(title="% of analyzed 2-minute segments", range=[0, 115],
+                   showgrid=True, gridcolor="#EEEEEE"),
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(l=50, r=20, t=30, b=40), font=dict(size=12))
+    os.makedirs(os.path.dirname(png_path) or ".", exist_ok=True)
+    fig.write_image(png_path, width=width, height=height)
+    return png_path
+
+
+def _band_hex(value):
+    return "#" + _kappa_band(value)[1].hexval()[2:]
+
+
+def _fmt(value, spec=".2f"):
+    v = pd.to_numeric(value, errors="coerce")
+    return "N/A" if pd.isna(v) else format(float(v), spec)
+
+
+def _table_style(extra=None):
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#003366")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F5F8")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]
+    return TableStyle(style + (extra or []))
+
+
+def _cucei_table(rows, styles):
+    """Dimension | Mean | SD | N | What it means (one line)."""
+    cell = ParagraphStyle("cucei_cell", parent=styles["Normal"], fontSize=8.5, leading=10.5)
+    data = [["Dimension", "Mean (1–4)", "SD", "N", "Interpretation"]]
+    for r in rows:
+        data.append([r["dimension"], _fmt(r["mean"]), _fmt(r["sd"]),
+                     str(r["n"]) if r["n"] is not None else "—",
+                     Paragraph(r["interpretation"], cell)])
+    t = Table(data, colWidths=[1.35 * inch, 0.8 * inch, 0.5 * inch, 0.4 * inch, 3.65 * inch])
+    t.setStyle(_table_style([("ALIGN", (1, 0), (3, -1), "CENTER")]))
+    return t
+
+
+def _validation_table(df):
+    """
+    Per-code validation from the combined_kappa.csv written by run.py:
+    Code | Human windows | AI windows | Agreement | kappa | AC1.
+    kappa and AC1 are colored by the same reliability bands.
+    """
+    rows = df[~df["code"].isin(SUMMARY_LABELS) & (df["code"] != MEAN_ROW_LABEL)]
+    has_ac1 = "ai_vs_sofia_ac1" in df.columns
+    header = ["Code", "Human", "AI", "Agree", "κ"] + (["AC1"] if has_ac1 else [])
+    data = [header]
+    style_extra = [("ALIGN", (1, 0), (-1, -1), "CENTER")]
+    grey = colors.HexColor("#9E9E9E")
+    for i, (_, r) in enumerate(rows.iterrows(), start=1):
+        pct = pd.to_numeric(r.get("pct_agreement"), errors="coerce")
+        # A behavior the human never recorded has no real agreement to grade:
+        # AC1 there is ~0.95 from shared absences alone. Grey, not green.
+        observed = (pd.to_numeric(r.get("n_human_marked"), errors="coerce") or 0) > 0
+        band = (lambda v: colors.HexColor(_band_hex(v))) if observed else (lambda v: grey)
+        line = [r["code"],
+                _fmt(r.get("n_human_marked"), ".0f"),
+                _fmt(r.get("n_ai_marked"), ".0f"),
+                "N/A" if pd.isna(pct) else f"{pct:.0f}%",
+                _fmt(r["ai_vs_sofia_kappa"])]
+        style_extra.append(("TEXTCOLOR", (4, i), (4, i), band(r["ai_vs_sofia_kappa"])))
+        if has_ac1:
+            line.append(_fmt(r["ai_vs_sofia_ac1"]))
+            style_extra.append(("TEXTCOLOR", (5, i), (5, i), band(r["ai_vs_sofia_ac1"])))
+        data.append(line)
+    widths = [0.8, 0.8, 0.8, 0.9, 0.9] + ([0.9] if has_ac1 else [])
+    t = Table(data, colWidths=[w * inch for w in widths])
+    t.setStyle(_table_style(style_extra))
+    return t
+
+
+def _clearing_summary(df):
+    """'κ ≥ 0.7 on a of b behaviors ... AC1 ≥ 0.7 on c of b' from the summary rows."""
+    s = df.set_index("code")
+    parts = []
+    for label, col, name in ((KAPPA_CLEAR_LABEL, "ai_vs_sofia_kappa", "κ"),
+                             (AC1_CLEAR_LABEL, "ai_vs_sofia_ac1", "AC1")):
+        if label in s.index and col in s.columns:
+            cleared = _fmt(s.loc[label, col], ".0f")
+            denom = _fmt(s.loc[label].get("n_codes_human_observed"), ".0f")
+            parts.append(f"{name} ≥ 0.7 on <b>{cleared} of {denom}</b>")
+    if not parts:
+        return None
+    return ("The AI reached the standard COPUS reliability threshold (Smith et al., "
+            "2013) with " + " and ".join(parts) + " of the behaviors the human "
+            "observer recorded in your class.")
 
 
 def generate_faculty_report(
@@ -471,34 +622,51 @@ def generate_faculty_report(
     survey_data,
     output_path,
     tmp_dir=None,
+    professor_id="",
+    data_dir=None,
 ):
     """
-    Produce a multi-page Faculty Feedback Report PDF and return `output_path`.
+    Produce the Faculty Feedback Report PDF and return `output_path`.
+
+    Sections, in order:
+      1. Header: professor, course, date, number of lectures analyzed
+      2. Behavioral Profile (summary, code frequencies, per-lecture timelines)
+      3. Student Perceptions (CUCEI): 7 dimensions, mean / SD / N + one line each
+      4. Comparison with golden reference lectures
+      5. Linking what you did to how students experienced it (2-3 observations)
+      6. Validation: kappa and Gwet's AC1 per code
+      7. Recommendations
+
+    Sections 3-5 show a short "not available yet" note when their input
+    (data/cucei_scores.csv, data/golden/) is missing, so the report always builds.
 
     Parameters
     ----------
     professor_name, course_name, semester : str
-        Cover-page metadata (labels only; no student-identifying info).
+        Header labels. Blank ones are left out rather than printed empty.
     lecture_results : list[dict]
-        One dict per lecture with keys `lecture_id` and `results_csv_path`
-        (a `dashboard_html_path` may be present but is not required here).
+        One dict per lecture with keys `lecture_id` and `results_csv_path`.
     kappa_results : dict | str
-        Either {comparison: {code: kappa}} or a path to `combined_kappa.csv`.
+        {comparison: {code: kappa}} or a path to `combined_kappa.csv`.
     survey_data : dict | str | None
-        Parsed survey summary, a path to `survey_analysis.csv`, or None.
+        Generic survey summary, used only as context for the narrative text.
     output_path : str
         Where to write the PDF.
     tmp_dir : str | None
         Where to write intermediate chart PNGs (defaults to alongside the PDF).
+    professor_id : str
+        Looks up this professor's CUCEI scores.
+    data_dir : str | None
+        Folder holding cucei_scores.csv and golden/ (default: the repo's data/).
     """
+    data_dir = data_dir or DEFAULT_DATA_DIR
     styles = _styles()
     tmp_dir = tmp_dir or os.path.join(os.path.dirname(output_path) or ".",
                                       "_report_assets")
     os.makedirs(tmp_dir, exist_ok=True)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    survey_summary, survey_df = _survey_summary_text(survey_data)
-    kappa_dict = load_kappa_dict(kappa_results)
+    survey_summary, _ = _survey_summary_text(survey_data)
 
     # Load every lecture's results once; skip missing/empty CSVs gracefully.
     lectures = []
@@ -517,24 +685,40 @@ def generate_faculty_report(
             "active_pct": a_pct, "passive_pct": p_pct,
         })
 
-    # Aggregate frequencies / split across all lectures for summary + recs.
     if lectures:
         all_df = pd.concat([l["df"] for l in lectures], ignore_index=True)
     else:
         all_df = pd.DataFrame(columns=["copus_codes"])
     overall_freq = code_frequency(all_df)
     overall_active, overall_passive = active_learning_split(all_df)
+    shares = code_shares(all_df)
 
+    cucei_rows = cucei_profile(professor_id, data_dir)
+    golden = golden_profile(data_dir)
+
+    # CUCEI scores give the narrative/recommendation prompts real student context.
+    if cucei_rows:
+        cucei_text = "\n".join(cucei_context_lines(cucei_rows))
+        survey_summary = "\n".join(x for x in (survey_summary, cucei_text) if x)
+    # recommendations() gets the CUCEI rows directly; keep them out of its
+    # generic survey text so they are not listed twice in the prompt.
+    rec_survey_summary, _ = _survey_summary_text(survey_data)
+
+    n_lect = len(lectures)
+    who = professor_name or "this instructor"
     story = []
 
-    # ---- Page 1: Cover ---------------------------------------------------- #
+    # ---- 1. Header --------------------------------------------------------- #
     story.append(Spacer(1, 1.4 * inch))
     story.append(Paragraph("Faculty Feedback Report", styles["CoverTitle"]))
-    story.append(Paragraph(professor_name, styles["CoverMeta"]))
-    story.append(Paragraph(course_name, styles["CoverMeta"]))
-    story.append(Paragraph(semester, styles["CoverMeta"]))
+    for line in (professor_name, course_name, semester):
+        if line:
+            story.append(Paragraph(line, styles["CoverMeta"]))
     story.append(Spacer(1, 0.3 * inch))
-    story.append(Paragraph(f"Generated {date.today().isoformat()}", styles["CoverMeta"]))
+    story.append(Paragraph(
+        f"{n_lect} lecture{'s' if n_lect != 1 else ''} analyzed · "
+        f"generated {date.today().strftime('%B %d, %Y').replace(' 0', ' ')}",
+        styles["CoverMeta"]))
     story.append(Paragraph(
         "University of South Florida — COPUS Classroom Analytics",
         styles["CoverMeta"]))
@@ -543,23 +727,23 @@ def generate_faculty_report(
         "For pedagogical development only.", styles["Disclaimer"]))
     story.append(PageBreak())
 
-    # ---- Page 2: Executive Summary --------------------------------------- #
-    story.append(Paragraph("Executive Summary", styles["SectionH"]))
-    n_lect = len(lectures)
+    # ---- 2. Behavioral Profile --------------------------------------------- #
+    story.append(Paragraph("Behavioral Profile", styles["SectionH"]))
     if not overall_freq.empty:
         most = overall_freq.iloc[0]["code"]
         least = overall_freq.iloc[-1]["code"]
     else:
         most = least = "—"
+    context = ", ".join(x for x in (course_name, semester) if x)
     story.append(Paragraph(
         f"This report summarizes an AI-assisted COPUS analysis of {n_lect} "
-        f"lecture{'s' if n_lect != 1 else ''} for {professor_name} "
-        f"({course_name}, {semester}). Each lecture was divided into 2-minute "
-        f"windows and classified against the 12 COPUS instructor codes. Across "
-        f"all lectures, roughly {overall_active}% of classified instructor time "
-        f"reflected active-learning behaviors and {overall_passive}% reflected "
-        f"lecturing or passive instruction. The most frequently observed code "
-        f"was <b>{most}</b> and the least frequent was <b>{least}</b>.",
+        f"lecture{'s' if n_lect != 1 else ''} for {who}"
+        f"{f' ({context})' if context else ''}. Each lecture was divided into "
+        f"2-minute segments and classified against the 12 COPUS instructor codes. "
+        f"Across all lectures, roughly {overall_active}% of classified instructor "
+        f"time reflected active-learning behaviors and {overall_passive}% reflected "
+        f"lecturing or passive instruction. The most frequently observed code was "
+        f"<b>{most}</b> and the least frequent was <b>{least}</b>.",
         styles["Narrative"]))
 
     if not overall_freq.empty:
@@ -572,7 +756,6 @@ def generate_faculty_report(
     story.append(_freq_table(overall_freq, styles))
     story.append(PageBreak())
 
-    # ---- Pages 3..N: Per-lecture timelines -------------------------------- #
     for lect in lectures:
         story.append(Paragraph(
             f"Lecture: {lect['lecture_id']}", styles["SectionH"]))
@@ -593,56 +776,120 @@ def generate_faculty_report(
         story.append(Paragraph(narrative, styles["Narrative"]))
         story.append(PageBreak())
 
-    # ---- Validation Summary ---------------------------------------------- #
-    story.append(Paragraph("Validation Summary", styles["SectionH"]))
-    if kappa_dict:
+    # ---- 3. Student Perceptions (CUCEI) ------------------------------------ #
+    story.append(Paragraph("Student Perceptions (CUCEI)", styles["SectionH"]))
+    if cucei_rows:
+        n_max = max((r["n"] or 0) for r in cucei_rows)
         story.append(Paragraph(
-            "Cohen's κ between the AI classifier and the human coder, computed per "
-            "COPUS code and pooled across lectures. Higher κ indicates stronger "
-            "agreement.",
-            styles["Narrative"]))
-        story.append(_kappa_table(kappa_dict))
-        story.append(Spacer(1, 0.15 * inch))
-        story.append(_legend_flowable(styles))
+            f"Your students completed the College and University Classroom Environment "
+            f"Inventory (CUCEI; up to {n_max} respondents). Each dimension is scored "
+            f"from 1 (strongly disagree) to 4 (strongly agree); higher is more "
+            f"favorable. Each dimension counts only students who answered all of "
+            f"its items.", styles["Narrative"]))
+        story.append(_cucei_table(cucei_rows, styles))
     else:
         story.append(Paragraph(
-            "No validation (kappa) data was provided for this report.",
-            styles["Narrative"]))
+            "<i>Student survey (CUCEI) results for this course have not been added "
+            "yet. This section will show your seven classroom-environment scores "
+            "once they are available.</i>", styles["Narrative"]))
     story.append(PageBreak())
 
-    # ---- Survey page (optional) ------------------------------------------ #
-    if survey_df is not None and not survey_df.empty:
-        story.append(Paragraph("Student Engagement", styles["SectionH"]))
-        story.append(Paragraph(
-            "Aggregated student survey responses collected alongside the "
-            "analyzed lectures. Where active-learning behaviors (e.g. PQ, AnQ) "
-            "were more frequent, higher engagement responses are expected; the "
-            "table below reports the raw survey summary.", styles["Narrative"]))
-        data = [["Question", "Type", "n", "Mean / Top response"]]
-        for _, r in survey_df.iterrows():
-            summary = (str(r.get("mean")) if str(r.get("type")) == "numeric"
-                       else str(r.get("top_response")))
-            data.append([str(r.get("question"))[:60], str(r.get("type")),
-                         str(r.get("n")), summary])
-        t = Table(data, colWidths=[3.0 * inch, 1.0 * inch, 0.6 * inch, 1.9 * inch])
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#003366")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [colors.white, colors.HexColor("#F2F5F8")]),
-        ]))
-        story.append(t)
-        story.append(PageBreak())
+    # ---- 4. Golden reference comparison ------------------------------------ #
+    golden_block = [Paragraph("Comparison with Reference Lectures", styles["SectionH"])]
+    if golden and shares:
+        g_active, _ = active_learning_split(golden["results"])
+        golden_block.append(Paragraph(
+            f"Your behavioral profile alongside the combined profile of "
+            f"{golden['n_lectures']} reference lecture"
+            f"{'s' if golden['n_lectures'] != 1 else ''} selected as examples of "
+            f"active-learning practice ({golden['n_windows']} segments). Bars show "
+            f"the share of analyzed 2-minute segments in which each behavior "
+            f"appeared; a segment can show several behaviors. These are reference "
+            f"points, not targets.", styles["Narrative"]))
+        golden_png = os.path.join(tmp_dir, "golden_comparison.png")
+        try:
+            render_golden_png(shares, golden["shares"], golden_png)
+            golden_block.append(Image(golden_png, width=6.3 * inch, height=3.15 * inch))
+        except Exception as e:  # noqa: BLE001
+            print(f"[pdf_report] golden chart failed: {e}")
+        diffs = sorted(((golden["shares"].get(c, 0) - shares.get(c, 0), c)
+                        for c in ACTIVE_LEARNING_CODES), reverse=True)
+        gap_pct, gap_code = diffs[0]
+        gap_line = (f" The largest difference is <b>{gap_code}</b> "
+                    f"({CODE_MEANINGS[gap_code].lower()}): {golden['shares'].get(gap_code, 0):g}% "
+                    f"of reference segments versus {shares.get(gap_code, 0):g}% of yours."
+                    if gap_pct >= 10 else "")
+        golden_block.append(Paragraph(
+            f"Active-learning behaviors made up <b>{overall_active}%</b> of coded "
+            f"instructor behavior in your lectures and <b>{g_active}%</b> in the "
+            f"reference lectures (the same measure as the chart on the Behavioral "
+            f"Profile page).{gap_line}", styles["Narrative"]))
+    else:
+        golden_block.append(Paragraph(
+            "<i>The reference (golden) lectures have not been added yet. This "
+            "section will compare your behavioral profile with theirs once they "
+            "are available.</i>", styles["Narrative"]))
+    story.append(KeepTogether(golden_block))
+    story.append(PageBreak())
 
-    # ---- Recommendations -------------------------------------------------- #
+    # ---- 5. Behavior-perception linking ------------------------------------ #
+    story.append(Paragraph("What You Did and How Students Experienced It",
+                           styles["SectionH"]))
+    observations = linking_observations(shares, cucei_rows)
+    if observations:
+        for obs in observations:
+            story.append(Paragraph(f"• {obs}", styles["Narrative"]))
+        story.append(Paragraph(
+            "<i>These pairings are observations, not measured effects: the survey "
+            "asks about the course as a whole, and the behaviors come from a sample "
+            "of class time.</i>", styles["Disclaimer"]))
+    else:
+        story.append(Paragraph(
+            "<i>Available once student survey (CUCEI) results are added.</i>",
+            styles["Narrative"]))
+    story.append(Spacer(1, 0.3 * inch))
+
+    # ---- 6. Validation ------------------------------------------------------ #
+    kappa_df = (pd.read_csv(kappa_results)
+                if isinstance(kappa_results, str) and os.path.exists(kappa_results)
+                else None)
+    validation = [Paragraph("How Reliable Is This Analysis?", styles["SectionH"])]
+    if kappa_df is not None and "ai_vs_sofia_kappa" in kappa_df.columns:
+        validation.append(Paragraph(
+            "Part of each lecture was also coded by a trained human observer. The "
+            "table compares the AI with that observer, per behavior: how many "
+            "segments each marked, how often they agreed, Cohen's κ, and Gwet's AC1. "
+            "AC1 stays meaningful when a behavior fills almost every segment (such as "
+            "lecturing), where κ can fall to near zero despite near-perfect agreement. "
+            "N/A means neither observer recorded that behavior; grey values are "
+            "behaviors only the AI recorded.", styles["Narrative"]))
+        validation.append(_validation_table(kappa_df))
+        summary = _clearing_summary(kappa_df)
+        if summary:
+            validation.append(Paragraph(summary, styles["Narrative"]))
+        validation.append(_legend_flowable(styles))
+    elif kappa_results:
+        kappa_dict = load_kappa_dict(kappa_results)
+        validation.append(Paragraph(
+            "Cohen's κ between the AI classifier and the human coder, per COPUS code, "
+            "pooled across lectures.", styles["Narrative"]))
+        validation.append(_kappa_table(kappa_dict))
+        validation.append(Spacer(1, 0.15 * inch))
+        validation.append(_legend_flowable(styles))
+    else:
+        validation.append(Paragraph(
+            "No validation data was provided for this report.", styles["Narrative"]))
+    story.append(KeepTogether(validation))
+    story.append(PageBreak())
+
+    # ---- 7. Recommendations ------------------------------------------------- #
     story.append(Paragraph("Recommendations", styles["SectionH"]))
     story.append(Paragraph(
         "The following suggestions are framed as opportunities, not "
         "evaluations, consistent with the COPUS philosophy of describing "
         "(rather than judging) classroom practice.", styles["Narrative"]))
-    for rec in recommendations(overall_freq, overall_active, survey_summary):
+    for rec in recommendations(overall_freq, overall_active, rec_survey_summary,
+                               shares=shares, cucei_rows=cucei_rows):
         story.append(Paragraph(f"• {rec}", styles["Narrative"]))
 
     doc = SimpleDocTemplate(
@@ -686,8 +933,12 @@ def main():
                     "run.py output directory.")
     parser.add_argument("--output-dir", required=True,
                         help="run.py output dir, e.g. output/dr_smith")
-    parser.add_argument("--professor", required=True)
-    parser.add_argument("--course", default="")
+    parser.add_argument("--professor", default="",
+                        help="Default: professor_name from lecture_professor_mapping.csv")
+    parser.add_argument("--course", default="",
+                        help="Default: course_name from lecture_professor_mapping.csv")
+    parser.add_argument("--data-dir", default=None,
+                        help="Folder with cucei_scores.csv and golden/ (default: repo data/)")
     parser.add_argument("--semester", default="")
     parser.add_argument("--pdf", default=None,
                         help="Output PDF path (default: <output-dir>/faculty_report.pdf)")
@@ -703,9 +954,14 @@ def main():
     survey_arg = survey_csv if os.path.exists(survey_csv) else None
     pdf_path = args.pdf or os.path.join(args.output_dir, "faculty_report.pdf")
 
+    from report.feedback_sections import resolve_identity
+    professor_id, professor_name, course_name = resolve_identity(
+        args.output_dir, {"professor": args.professor, "course": args.course})
     generate_faculty_report(
-        professor_name=args.professor,
-        course_name=args.course,
+        professor_name=professor_name,
+        course_name=course_name,
+        professor_id=professor_id,
+        data_dir=args.data_dir,
         semester=args.semester,
         lecture_results=lectures,
         kappa_results=kappa_arg,

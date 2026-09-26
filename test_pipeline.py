@@ -1,23 +1,33 @@
 import argparse
+import json
 import os
+from collections import Counter
 from dotenv import load_dotenv
 load_dotenv()
 
 from chunk.chunker import chunk_video
 from classify.classifier import (
     DEFAULT_MODEL,
+    GENERATION_SEED,
+    GENERATION_TEMPERATURE,
     classify_chunk_multimodal,
     classify_chunk_vision_only,
     classify_chunk_audio_only,
     classify_chunk_transcript_only,
 )
 from aggregate.aggregator import aggregate_results
+from utils.professor_ids import resolve_professor
 
 # __main__ smoke-run defaults only; run.py drives real runs through run_arm().
 DEFAULT_LECTURE_PATH = "videoplayback.mp4"
 DEFAULT_OUTPUT_DIR = "output/pipeline_test"
 WINDOW_SECONDS = 120
 MAX_CHUNKS = 24  # __main__ smoke-run default only; real runs use --windows
+
+# Attempts per window per arm before it is recorded as failed. A window that
+# stays failed is dropped from every arm's comparison, so it is worth spending
+# two extra calls here rather than losing the window for all four arms.
+MAX_ATTEMPTS = 3
 
 
 def lecture_id_from_path(lecture_path):
@@ -38,6 +48,35 @@ ARM_CONFIG = {
 }
 
 
+def _stale_settings(result_json, model):
+    """
+    Ways a cached per-chunk result disagrees with what this run would produce.
+
+    run_arm reuses any chunk that already has a JSON, which is what makes reruns
+    free -- but a JSON written before decoding was pinned (sampled at temperature
+    1.0, or seeded differently, or from another model) is not comparable with a
+    fresh one, and nothing about the CSV would show it.
+    """
+    try:
+        with open(result_json) as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    reasons = []
+    cached_model = data.get("model")
+    if cached_model and cached_model != model:
+        reasons.append(f"model={cached_model} (this run uses {model})")
+    # Pre-pinning JSONs have no temperature key at all: they were sampled.
+    if "temperature" not in data:
+        reasons.append("no recorded temperature (sampled, before decoding was pinned)")
+    elif float(data["temperature"]) != float(GENERATION_TEMPERATURE):
+        reasons.append(f"temperature={data['temperature']} "
+                       f"(this run uses {GENERATION_TEMPERATURE})")
+    elif int(data.get("seed", -1)) != int(GENERATION_SEED):
+        reasons.append(f"seed={data.get('seed')} (this run uses {GENERATION_SEED})")
+    return reasons
+
+
 def resolve_window_indices(window_indices=None, max_chunks=None, chunks_dir=None):
     """
     The set of chunk indices an arm should process.
@@ -55,18 +94,25 @@ def resolve_window_indices(window_indices=None, max_chunks=None, chunks_dir=None
 
 def run_arm(arm_name, chunks_dir, results_dir, output_csv, lecture_id,
             max_chunks=None, window_seconds=WINDOW_SECONDS,
-            window_indices=None, model=DEFAULT_MODEL):
+            window_indices=None, model=DEFAULT_MODEL, professor_id="",
+            max_attempts=MAX_ATTEMPTS):
     """
     Classify the requested chunks for one arm, then aggregate to a CSV.
     Skips a chunk if its per-chunk result JSON already exists (idempotent),
     so re-runs make no new Gemini calls.
 
-    A chunk that raises is retried once and then recorded as failed -- it no
-    longer disappears silently. Returns a dict:
-      {"csv", "indices", "processed", "missing", "failed"}
+    A chunk that raises is retried up to max_attempts times (transient Vertex
+    errors and timeouts are the common case) and only then recorded as failed --
+    it no longer disappears silently. A window that no arm can fill is dropped
+    from EVERY arm at comparison time, so retries are what keep the paired
+    per-arm window set intact. Returns a dict:
+      {"csv", "indices", "processed", "missing", "failed", "retries"}
     """
     cfg = ARM_CONFIG[arm_name]
     indices = resolve_window_indices(window_indices, max_chunks, chunks_dir)
+    # {window: attempts spent before it finally failed}, {window: winning attempt}
+    attempts_used, recovered = {}, {}
+    stale = []
 
     print(f"\n=== Classifying arm: {arm_name} "
           f"({len(indices)} windows, model={model}) ===")
@@ -79,10 +125,11 @@ def run_arm(arm_name, chunks_dir, results_dir, output_csv, lecture_id,
             continue
         result_json = os.path.join(results_dir, f"chunk_{i:03d}_result.json")
         if os.path.exists(result_json):
+            stale.extend(_stale_settings(result_json, model))
             print(f"Chunk {i} already classified, skipping")
             continue
         # One retry, then record the failure rather than swallowing it.
-        for attempt in (1, 2):
+        for attempt in range(1, max_attempts + 1):
             try:
                 cfg["fn"](
                     chunk_path,
@@ -92,20 +139,35 @@ def run_arm(arm_name, chunks_dir, results_dir, output_csv, lecture_id,
                     window_end=(i + 1) * window_seconds,
                     model=model,
                 )
+                if attempt > 1:
+                    recovered[i] = attempt
+                    print(f"  [ok] chunk {i} arm {arm_name} succeeded on attempt "
+                          f"{attempt}/{max_attempts}")
                 break
             except Exception as e:
-                if attempt == 1:
-                    print(f"  [retry] chunk {i} arm {arm_name} failed: {e}")
+                attempts_used[i] = attempt
+                if attempt < max_attempts:
+                    print(f"  [retry] chunk {i} arm {arm_name} attempt "
+                          f"{attempt}/{max_attempts} failed: {e}")
                     continue
-                print(f"  [ERROR] chunk {i} arm {arm_name} failed twice: {e}")
+                print(f"  [ERROR] chunk {i} arm {arm_name} failed "
+                      f"{max_attempts} times: {e}")
                 failed.append(i)
 
     if failed:
-        print(f"\n[ERROR] arm {arm_name}: {len(failed)} chunk(s) failed after retry: "
-              f"{failed}")
+        print(f"\n[ERROR] arm {arm_name}: {len(failed)} chunk(s) failed after "
+              f"{max_attempts} attempts: {failed}. Every arm is scored on the "
+              f"windows ALL arms have, so these windows will be dropped from the "
+              f"comparison for every arm -- re-run to fill them.")
     if missing:
         print(f"[warn] arm {arm_name}: {len(missing)} chunk(s) had no media on disk: "
               f"{missing}")
+    if stale:
+        for reason, count in sorted(Counter(stale).items()):
+            print(f"[warn] arm {arm_name}: {count} cached chunk(s) were produced "
+                  f"with {reason}. Cached results are REUSED as-is, so this run "
+                  f"mixes settings. Delete {results_dir} and re-run if these "
+                  f"numbers are going in the thesis.")
 
     print(f"\n=== Aggregating arm: {arm_name} ===")
     aggregate_results(
@@ -113,10 +175,24 @@ def run_arm(arm_name, chunks_dir, results_dir, output_csv, lecture_id,
         output_csv=output_csv,
         lecture_id=lecture_id,
         arm=arm_name,
+        professor_id=professor_id,
     )
     processed = len([i for i in indices
                      if os.path.exists(os.path.join(results_dir,
                                                     f"chunk_{i:03d}_result.json"))])
+    retries = {
+        "max_attempts": max_attempts,
+        # Windows that needed more than one attempt but did succeed.
+        "recovered": dict(sorted(recovered.items())),
+        # Extra attempts spent beyond the first, across all windows.
+        "retry_attempts": sum(a - 1 for a in recovered.values())
+                          + sum(max(a - 1, 0) for i, a in attempts_used.items()
+                                if i in failed),
+        "failed": list(failed),
+    }
+    if recovered:
+        print(f"Arm {arm_name}: {len(recovered)} window(s) needed a retry "
+              f"(succeeded on attempt {sorted(set(recovered.values()))})")
     print(f"Arm {arm_name}: {processed}/{len(indices)} windows have results")
     return {
         "csv": output_csv,
@@ -124,6 +200,7 @@ def run_arm(arm_name, chunks_dir, results_dir, output_csv, lecture_id,
         "processed": processed,
         "missing": missing,
         "failed": failed,
+        "retries": retries,
     }
 
 
@@ -140,6 +217,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     lecture_id = args.lecture_id or lecture_id_from_path(args.lecture)
+    professor_id, _ = resolve_professor(args.lecture)
     # Every output is scoped under the lecture id, so smoke-running a second
     # lecture no longer overwrites the first one's chunks, results, or CSVs.
     lecture_dir = os.path.join(args.output_dir, lecture_id)
@@ -165,6 +243,7 @@ if __name__ == "__main__":
             lecture_id=lecture_id,
             max_chunks=args.max_chunks,
             model=args.model,
+            professor_id=professor_id,
         )["csv"]
 
     print(f"\nDone! Results: {output_csvs}")

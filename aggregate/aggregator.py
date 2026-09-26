@@ -2,13 +2,14 @@ import json
 import csv
 import os
 
-def aggregate_results(results_dir, output_csv, lecture_id, arm="multimodal"):
+def aggregate_results(results_dir, output_csv, lecture_id, arm="multimodal",
+                      professor_id=""):
     """
     Collects all per-chunk JSON results and writes them to a single CSV.
 
     Each row in the CSV represents one 2-minute window with columns:
-    lecture_id, window_index, window_start, window_end, arm, model,
-    copus_codes, reasoning
+    lecture_id, professor_id, window_index, window_start, window_end, arm,
+    model, copus_codes, reasoning
 
     `model` is read back from each per-chunk JSON rather than passed in, so a
     results dir that mixes models stays traceable row by row.
@@ -32,6 +33,7 @@ def aggregate_results(results_dir, output_csv, lecture_id, arm="multimodal"):
 
         results.append({
             "lecture_id": lecture_id,
+            "professor_id": professor_id,
             "window_index": data.get("chunk_index"),
             "window_start": data.get("window_start"),
             "window_end": data.get("window_end"),
@@ -43,7 +45,7 @@ def aggregate_results(results_dir, output_csv, lecture_id, arm="multimodal"):
 
     # Write to CSV
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    fieldnames = ["lecture_id", "window_index", "window_start",
+    fieldnames = ["lecture_id", "professor_id", "window_index", "window_start",
                   "window_end", "arm", "model", "copus_codes", "reasoning"]
 
     with open(output_csv, "w", newline="") as f:

@@ -9,6 +9,7 @@ on hand, not pre-built lecture/kappa/survey structures.
 """
 import os
 
+from report.feedback_sections import resolve_identity
 from report.pdf_report import generate_faculty_report, _discover_lectures
 
 
@@ -26,10 +27,14 @@ def generate_report(output_dir, pdf_path, meta):
 
     kappa_csv = os.path.join(output_dir, "combined_kappa.csv")
     survey_csv = os.path.join(output_dir, "survey_analysis.csv")
+    # Sidebar fields win; lecture_professor_mapping.csv fills any left blank, so
+    # the header never renders as "Professor ( , )".
+    professor_id, professor_name, course_name = resolve_identity(output_dir, meta)
 
     return generate_faculty_report(
-        professor_name=meta.get("professor") or "Professor",
-        course_name=meta.get("course") or "",
+        professor_name=professor_name,
+        course_name=course_name,
+        professor_id=professor_id,
         semester=meta.get("semester") or "",
         lecture_results=lecture_results,
         kappa_results=kappa_csv if os.path.exists(kappa_csv) else None,

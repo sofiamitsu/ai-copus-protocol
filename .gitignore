@@ -22,3 +22,9 @@ gcp-key.json
 # pipeline outputs — includes raw 2-min A/V chunks (IRB: no AV in the repo)
 # and is ~283MB after a single 4-arm run.
 output/
+
+# study data -- student survey scores (IRB) and reference-lecture outputs.
+# Only the READMEs describing what goes here are tracked.
+data/**
+!data/**/
+!data/**/README.md
