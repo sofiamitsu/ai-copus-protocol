@@ -3,8 +3,8 @@ Phase 8 — Streamlit UI for the COPUS pipeline.
 
 A local web front end (localhost:8501) wrapping the Phase 7 CLI. It saves
 uploaded files to a temp dir, then calls the SAME functions the CLI uses
-(`process_lecture`, `build_combined_kappa`, `build_professor_dashboard`,
-`analyze_survey` from run.py) — no pipeline logic is re-implemented here.
+(`process_lecture`, `build_combined_kappa`, `build_professor_dashboard`
+from run.py) — no pipeline logic is re-implemented here.
 
 Run with:  uv run streamlit run app.py
 
@@ -37,7 +37,6 @@ from run import (
     process_lecture,
     build_combined_kappa,
     build_professor_dashboard,
-    analyze_survey,
 )
 
 WINDOW_SECONDS = 120
@@ -149,10 +148,6 @@ class PipelineRunner:
             os.path.join(cfg["output_dir"], "professor_dashboard.html"),
             WINDOW_SECONDS,
         )
-        if cfg["survey"]:
-            analyze_survey(
-                cfg["survey"], os.path.join(cfg["output_dir"], "survey_analysis.csv")
-            )
 
         self._set(1.0, "Done")
         self.result = {
@@ -521,12 +516,6 @@ elif ss.stage == "idle":
                 st.warning(f"This workbook is for `{cucei_pid}`, but the lecture "
                            f"folder says `{folder_id}`. The run will use `{cucei_pid}`.")
 
-    st.subheader("4 · Student Survey (optional)")
-    survey_file = st.file_uploader(
-        "Other student survey — (optional, generic summary only)", type=["csv"], key="survey",
-        help="Not for CUCEI — upload the CUCEI workbook in section 3."
-    )
-
     # A lecture is runnable only if it has BOTH a readable video and Sofia's
     # coding. Keyed on lecture_paths, not the uploader — a lecture given by path
     # has no uploaded file object.
@@ -576,10 +565,6 @@ elif ss.stage == "idle":
             sofia_path = _save_upload(sofia_files[i], inputs, f"{lid}_sofia.xlsx")
             lectures.append((lec_path, lid, sofia_path, lecture_windows.get(i)))
 
-        survey_path = (
-            _save_upload(survey_file, inputs, "survey.csv") if survey_file else None
-        )
-
         data_dir = None
         if cucei_scores is not None:
             data_dir = stage_data_dir(cucei_scores, os.path.join(temp_dir, "data"))
@@ -594,7 +579,6 @@ elif ss.stage == "idle":
             "primary_arm": primary_arm,
             "max_chunks": int(cap) or None,
             "model": model,
-            "survey": survey_path,
             "professor": professor,
             # Stamped on every lecture so the report finds the uploaded scores;
             # None keeps the usual folder / name-slug resolution.
@@ -633,7 +617,7 @@ else:
         if ss.stage == "done":
             st.success(f"Pipeline complete for **{meta.get('professor') or 'professor'}**.")
 
-        tab_k, tab_t, tab_s = st.tabs(["κ Scores", "Behavioral Timelines", "Survey Analysis"])
+        tab_k, tab_t = st.tabs(["κ Scores", "Behavioral Timelines"])
 
         # --- Tab 1: kappa ---
         with tab_k:
@@ -672,15 +656,6 @@ else:
             st.divider()
             st.markdown("**Professor-level combined profile**")
             _embed_html(os.path.join(output_dir, "professor_dashboard.html"), 520)
-
-        # --- Tab 3: survey ---
-        with tab_s:
-            survey_csv = os.path.join(output_dir, "survey_analysis.csv")
-            if os.path.exists(survey_csv):
-                st.dataframe(pd.read_csv(survey_csv), use_container_width=True)
-            else:
-                st.info("No survey uploaded.")
-            st.caption("AI-generated feedback narrative arrives with Phase 9.")
 
         # --- Downloads ---
         st.divider()
