@@ -17,6 +17,7 @@ a report can be built directly from a `run.py` output directory.
 import os
 import argparse
 from datetime import date
+from xml.sax.saxutils import escape as xml_escape
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -59,7 +60,7 @@ from validate.validator import (
 )
 from report.feedback_sections import (
     DEFAULT_DATA_DIR, code_shares, cucei_context_lines, cucei_profile,
-    cucei_recommendation, golden_profile, linking_observations,
+    DEFAULT_GOLDEN_DIR, cucei_recommendation, golden_lectures, linking_observations,
 )
 
 # Golden-comparison chart: the report's navy for the professor, a muted gold for
@@ -416,6 +417,9 @@ def _styles():
         "SectionH", parent=styles["Heading1"], fontSize=18,
         textColor=colors.HexColor("#003366"), spaceAfter=10))
     styles.add(ParagraphStyle(
+        "SubH", parent=styles["Heading2"], fontSize=13,
+        textColor=colors.HexColor("#003366"), spaceBefore=14, spaceAfter=2))
+    styles.add(ParagraphStyle(
         "Narrative", parent=styles["Normal"], fontSize=10.5, leading=15,
         spaceBefore=8, spaceAfter=8))
     return styles
@@ -499,11 +503,12 @@ def _legend_flowable(styles):
                      styles["Normal"])
 
 
-def render_golden_png(prof_shares, golden_shares, png_path, width=760, height=380):
+def render_golden_png(prof_shares, golden_shares, png_path, width=760, height=380,
+                      golden_label="Reference lecture"):
     """
-    Grouped horizontal bars: % of windows per COPUS code, this professor vs the
-    golden aggregate. Codes appear in protocol order; a code shows when either
-    profile used it.
+    Grouped horizontal bars: % of windows per COPUS code, this professor vs ONE
+    golden reference lecture. Codes appear in protocol order; a code shows when
+    either profile used it.
     """
     codes = [c for c in INSTRUCTOR_CODES
              if prof_shares.get(c, 0) > 0 or golden_shares.get(c, 0) > 0]
@@ -511,7 +516,7 @@ def render_golden_png(prof_shares, golden_shares, png_path, width=760, height=38
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=codes, x=[golden_shares.get(c, 0) for c in codes], orientation="h",
-        name="Golden reference", marker_color=GOLDEN_COLOR,
+        name=golden_label, marker_color=GOLDEN_COLOR,
         text=[f"{golden_shares.get(c, 0):g}%" for c in codes], textposition="outside"))
     fig.add_trace(go.Bar(
         y=codes, x=[prof_shares.get(c, 0) for c in codes], orientation="h",
@@ -624,6 +629,7 @@ def generate_faculty_report(
     tmp_dir=None,
     professor_id="",
     data_dir=None,
+    golden_dir=None,
 ):
     """
     Produce the Faculty Feedback Report PDF and return `output_path`.
@@ -632,13 +638,15 @@ def generate_faculty_report(
       1. Header: professor, course, date, number of lectures analyzed
       2. Behavioral Profile (summary, code frequencies, per-lecture timelines)
       3. Student Perceptions (CUCEI): 7 dimensions, mean / SD / N + one line each
-      4. Comparison with golden reference lectures
+      4. Comparison with each golden reference lecture (one chart per lecture,
+         with its instructor's name and YouTube link; never pooled)
       5. Linking what you did to how students experienced it (2-3 observations)
       6. Validation: kappa and Gwet's AC1 per code
       7. Recommendations
 
     Sections 3-5 show a short "not available yet" note when their input
-    (data/cucei_scores.csv, data/golden/) is missing, so the report always builds.
+    (CUCEI scores in data/, golden/golden_lectures.csv) is missing, so the report
+    always builds.
 
     Parameters
     ----------
@@ -657,7 +665,10 @@ def generate_faculty_report(
     professor_id : str
         Looks up this professor's CUCEI scores.
     data_dir : str | None
-        Folder holding cucei_scores.csv and golden/ (default: the repo's data/).
+        Folder holding cucei/ and cucei_scores.csv (default: the repo's data/).
+    golden_dir : str | None
+        Folder holding golden_lectures.csv and one results folder per reference
+        lecture (default: the repo's golden/).
     """
     data_dir = data_dir or DEFAULT_DATA_DIR
     styles = _styles()
@@ -694,7 +705,7 @@ def generate_faculty_report(
     shares = code_shares(all_df)
 
     cucei_rows = cucei_profile(professor_id, data_dir)
-    golden = golden_profile(data_dir)
+    goldens = golden_lectures(golden_dir or DEFAULT_GOLDEN_DIR)
 
     # CUCEI scores give the narrative/recommendation prompts real student context.
     if cucei_rows:
@@ -794,42 +805,58 @@ def generate_faculty_report(
             "once they are available.</i>", styles["Narrative"]))
     story.append(PageBreak())
 
-    # ---- 4. Golden reference comparison ------------------------------------ #
-    golden_block = [Paragraph("Comparison with Reference Lectures", styles["SectionH"])]
-    if golden and shares:
-        g_active, _ = active_learning_split(golden["results"])
-        golden_block.append(Paragraph(
-            f"Your behavioral profile alongside the combined profile of "
-            f"{golden['n_lectures']} reference lecture"
-            f"{'s' if golden['n_lectures'] != 1 else ''} selected as examples of "
-            f"active-learning practice ({golden['n_windows']} segments). Bars show "
-            f"the share of analyzed 2-minute segments in which each behavior "
-            f"appeared; a segment can show several behaviors. These are reference "
-            f"points, not targets.", styles["Narrative"]))
-        golden_png = os.path.join(tmp_dir, "golden_comparison.png")
-        try:
-            render_golden_png(shares, golden["shares"], golden_png)
-            golden_block.append(Image(golden_png, width=6.3 * inch, height=3.15 * inch))
-        except Exception as e:  # noqa: BLE001
-            print(f"[pdf_report] golden chart failed: {e}")
-        diffs = sorted(((golden["shares"].get(c, 0) - shares.get(c, 0), c)
-                        for c in ACTIVE_LEARNING_CODES), reverse=True)
-        gap_pct, gap_code = diffs[0]
-        gap_line = (f" The largest difference is <b>{gap_code}</b> "
-                    f"({CODE_MEANINGS[gap_code].lower()}): {golden['shares'].get(gap_code, 0):g}% "
-                    f"of reference segments versus {shares.get(gap_code, 0):g}% of yours."
-                    if gap_pct >= 10 else "")
-        golden_block.append(Paragraph(
-            f"Active-learning behaviors made up <b>{overall_active}%</b> of coded "
-            f"instructor behavior in your lectures and <b>{g_active}%</b> in the "
-            f"reference lectures (the same measure as the chart on the Behavioral "
-            f"Profile page).{gap_line}", styles["Narrative"]))
+    # ---- 4. Golden reference comparisons ----------------------------------- #
+    # One comparison per reference lecture: each is by a different instructor,
+    # so they are never pooled into a single "golden" profile.
+    story.append(Paragraph("Comparison with Reference Lectures", styles["SectionH"]))
+    if goldens and shares:
+        n_g = len(goldens)
+        story.append(Paragraph(
+            f"Below, your behavioral profile is set beside {n_g} reference "
+            f"lecture{'s' if n_g != 1 else ''}, each by a different instructor and "
+            f"chosen as an example of active-learning practice. Each is shown on its "
+            f"own, with a link so you can watch it. Bars show the share of analyzed "
+            f"2-minute segments in which each behavior appeared; a segment can show "
+            f"several behaviors. These are reference points, not targets.",
+            styles["Narrative"]))
+        for n, g in enumerate(goldens, start=1):
+            who = g["professor_name"] or f"Reference lecture {n}"
+            heading = f"Reference lecture {n}: {xml_escape(who)}"
+            if g["lecture_title"]:
+                heading += f" — <i>{xml_escape(g['lecture_title'])}</i>"
+            block = [Paragraph(heading, styles["SubH"])]
+            if g["youtube_url"]:
+                url = xml_escape(g["youtube_url"], {'"': "&quot;"})
+                block.append(Paragraph(
+                    f'Watch the lecture: <link href="{url}" color="blue">'
+                    f'<u>{url}</u></link> ({g["n_windows"]} segments analyzed)',
+                    styles["Narrative"]))
+            png = os.path.join(tmp_dir, f"golden_comparison_{n}.png")
+            try:
+                render_golden_png(shares, g["shares"], png, golden_label=who)
+                block.append(Image(png, width=6.3 * inch, height=3.15 * inch))
+            except Exception as e:  # noqa: BLE001
+                print(f"[pdf_report] golden chart {n} failed: {e}")
+            g_active, _ = active_learning_split(g["results"])
+            diffs = sorted(((g["shares"].get(c, 0) - shares.get(c, 0), c)
+                            for c in ACTIVE_LEARNING_CODES), reverse=True)
+            gap_pct, gap_code = diffs[0]
+            gap_line = (f" The largest difference is <b>{gap_code}</b> "
+                        f"({CODE_MEANINGS[gap_code].lower()}): "
+                        f"{g['shares'].get(gap_code, 0):g}% of this lecture's segments "
+                        f"versus {shares.get(gap_code, 0):g}% of yours."
+                        if gap_pct >= 10 else "")
+            block.append(Paragraph(
+                f"Active-learning behaviors made up <b>{overall_active}%</b> of coded "
+                f"instructor behavior in your lectures and <b>{g_active}%</b> in this "
+                f"one (the same measure as the chart on the Behavioral Profile "
+                f"page).{gap_line}", styles["Narrative"]))
+            story.append(KeepTogether(block))
     else:
-        golden_block.append(Paragraph(
+        story.append(Paragraph(
             "<i>The reference (golden) lectures have not been added yet. This "
-            "section will compare your behavioral profile with theirs once they "
-            "are available.</i>", styles["Narrative"]))
-    story.append(KeepTogether(golden_block))
+            "section will compare your behavioral profile with each of them once "
+            "they are available.</i>", styles["Narrative"]))
     story.append(PageBreak())
 
     # ---- 5. Behavior-perception linking ------------------------------------ #
@@ -938,7 +965,7 @@ def main():
     parser.add_argument("--course", default="",
                         help="Default: course_name from lecture_professor_mapping.csv")
     parser.add_argument("--data-dir", default=None,
-                        help="Folder with cucei_scores.csv and golden/ (default: repo data/)")
+                        help="Folder with cucei/ and cucei_scores.csv (default: repo data/)")
     parser.add_argument("--semester", default="")
     parser.add_argument("--pdf", default=None,
                         help="Output PDF path (default: <output-dir>/faculty_report.pdf)")

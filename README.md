@@ -92,12 +92,12 @@ uv run streamlit run app.py
    sampling scheme, shows which blocks to watch, and pre-fills the window list.
 2. **Download the coding sheet** for each lecture. It holds exactly the sampled windows,
    each row already labelled with its minute range. Code every row.
-3. **Upload the filled sheets**, plus an optional CUCEI workbook and an optional
-   student survey CSV.
+3. **Upload the filled sheets**, plus the professor's CUCEI workbook (optional). Its
+   scores go into the Faculty Feedback Report.
 4. In the sidebar, pick the **arm** (`all` runs the 4-arm ablation), the **model**, and
    **Parallel requests**.
 5. **Run.** A live log and progress bar follow the run, and Cancel stops it within
-   seconds. The results page has κ tables, behavioural timelines, the survey summary, a
+   seconds. The results page has κ tables, behavioural timelines, a
    **Faculty Feedback Report (PDF)**, and a ZIP of the raw results (raw A/V chunks are
    left out).
 
@@ -144,7 +144,7 @@ uv run python run.py \
 | `--max-chunks N` | Only the first N windows. Useful for a quick smoke run; can't be combined with `--windows`. |
 | `--model` | `gemini-2.5-flash` (default) or `gemini-2.5-pro` |
 | `--workers N` | Maximum number of Gemini requests in flight (default 8, `1` = sequential) |
-| `--survey` | Optional student survey CSV to summarise |
+| `--survey` | Optional generic student survey CSV to summarise (CLI only; CUCEI scores go through the app or `data/`) |
 | `--professor-id`, `--course` | Labels for the outputs and the report |
 
 Reruns are idempotent. Chunks that already exist are not cut again, and windows that
@@ -296,6 +296,7 @@ uv run python -m tests.test_feedback_report
 │   └── convert_copus_sheet.py  # coding sheet .xlsx → long-format CSV
 ├── report/                 # dashboards, Faculty Feedback Report PDF
 ├── utils/                  # sparse windows, professor IDs, CUCEI scores
+├── golden/                 # reference lectures the report compares against
 ├── scripts/                # offline analysis CLIs
 ├── tests/                  # offline acceptance tests
 └── docs/                   # changelog and development notes

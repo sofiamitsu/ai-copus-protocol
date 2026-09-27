@@ -11,7 +11,7 @@ import pandas as pd
 
 import report.pdf_report as pr
 from report.feedback_sections import (
-    code_shares, cucei_profile, golden_profile, interpret_dimension,
+    code_shares, cucei_profile, golden_lectures, interpret_dimension,
     linking_observations, resolve_identity,
 )
 from utils.cucei import DIMENSIONS, load_all, load_scores
@@ -106,19 +106,32 @@ assert len(only_lec) == 1 and "(Lec)" in only_lec[0]
 assert linking_observations(shares, None) == []
 print("ok  linking: Lec used only when nothing else was seen; no CUCEI -> no observations")
 
-# --- Golden aggregate -----------------------------------------------------------
-assert golden_profile(os.path.join(tmp, "nothing_here")) is None
-for name, codes in (("g1/lec_a", ["Lec", "Lec|MG", "Lec|PQ", "Lec"]),
-                    ("g2/lec_b", ["Lec|MG", "MG", "Lec", "Lec|AnQ"])):
-    d = os.path.join(data_dir, "golden", name)
+# --- Golden reference lectures: one profile each, never pooled -----------------
+golden_dir = os.path.join(tmp, "golden")
+assert golden_lectures(os.path.join(tmp, "nothing_here")) == []
+for name, codes in (("rivera", ["Lec", "Lec|MG", "Lec|PQ", "Lec"]),
+                    ("chen", ["Lec|MG", "MG", "Lec", "Lec|AnQ"]),
+                    ("unlisted", ["MG"] * 4)):
+    d = os.path.join(golden_dir, name)
     os.makedirs(d)
     pd.DataFrame({"copus_codes": codes, "window_start": 0, "window_end": 120}).to_csv(
         os.path.join(d, "results_multimodal.csv"), index=False)
-g = golden_profile(data_dir)
-assert g["n_lectures"] == 2 and g["n_windows"] == 8
-assert g["shares"]["MG"] == 37.5 and g["shares"]["Lec"] == 87.5, g["shares"]
+pd.DataFrame([
+    {"folder": "chen", "professor_name": "Dr. Chen", "lecture_title": "Intro Physics",
+     "youtube_url": "https://www.youtube.com/watch?v=abc123"},
+    {"folder": "rivera", "professor_name": "Dr. Rivera", "lecture_title": "",
+     "youtube_url": "https://youtu.be/xyz789"},
+    {"folder": "missing", "professor_name": "Dr. Nobody", "lecture_title": "",
+     "youtube_url": ""},
+]).to_csv(os.path.join(golden_dir, "golden_lectures.csv"), index=False)
+g = golden_lectures(golden_dir)
+assert [x["professor_name"] for x in g] == ["Dr. Chen", "Dr. Rivera"], g
+assert g[0]["shares"]["MG"] == 50.0 and g[1]["shares"]["MG"] == 25.0   # not pooled 37.5
+assert g[0]["youtube_url"] == "https://www.youtube.com/watch?v=abc123"
+assert g[0]["lecture_title"] == "Intro Physics" and g[1]["lecture_title"] == ""
+assert g[1]["n_windows"] == 4
 assert code_shares(pd.DataFrame({"copus_codes": ["Lec|Lec", None]})) == {"Lec": 50.0}
-print("ok  golden: pools every results_multimodal.csv under data/golden, window-weighted")
+print("ok  golden: one profile per manifest row, in order; unlisted/missing skipped")
 
 # --- Identity: sidebar wins, mapping fills blanks -------------------------------
 out = os.path.join(tmp, "out")
@@ -150,16 +163,25 @@ pd.DataFrame([
      "n_codes_human_observed": 1, "ai_vs_sofia_ac1": 1},
 ]).to_csv(kappa, index=False)
 
-for label, dd in (("full", data_dir), ("placeholders", os.path.join(tmp, "empty"))):
+empty = os.path.join(tmp, "empty")
+pdfs = {}
+for label, dd, gd in (("full", data_dir, golden_dir), ("placeholders", empty, empty)):
     pdf = os.path.join(tmp, f"{label}.pdf")
     pr.generate_faculty_report(
         professor_name="Dr. Rodrigo", course_name="EGN 3000", semester="",
         lecture_results=pr._discover_lectures(out), kappa_results=kappa,
-        survey_data=None, output_path=pdf, professor_id="professor_1", data_dir=dd)
+        survey_data=None, output_path=pdf, professor_id="professor_1", data_dir=dd,
+        golden_dir=gd)
     assert os.path.getsize(pdf) > 5000, label
     with open(pdf, "rb") as f:
-        assert f.read(5) == b"%PDF-"
-print("ok  report builds with CUCEI + golden, and with neither (placeholders)")
+        pdfs[label] = f.read()
+    assert pdfs[label][:5] == b"%PDF-"
+# Each reference lecture's link is a clickable URI annotation, one per lecture.
+assert b"https://www.youtube.com/watch?v=abc123" in pdfs["full"]
+assert b"https://youtu.be/xyz789" in pdfs["full"]
+assert b"youtu" not in pdfs["placeholders"]
+assert os.path.exists(os.path.join(tmp, "_report_assets", "golden_comparison_2.png"))
+print("ok  report builds with CUCEI + one chart/link per golden, and with neither")
 
 clearing = pr._clearing_summary(pd.read_csv(kappa))
 assert "1 of 1" in clearing, clearing
@@ -306,20 +328,17 @@ base = os.path.join(tmp, "base_data")
 os.makedirs(os.path.join(base, "cucei"))
 fake_workbook(os.path.join(base, "cucei", "CUCEI PROFESSOR 9.xlsm"))
 write_cucei(os.path.join(base, "cucei_scores.csv"), scores("professor_3", [3.0] * 7))
-os.makedirs(os.path.join(base, "golden", "lec1"))
 upload_dir = os.path.join(tmp, "uploads")
 os.makedirs(upload_dir)
 # The file name need not carry the professor number when the caller supplies it.
 upload, upload_mean = fake_workbook(os.path.join(upload_dir, "CUCEI final.xlsm"))
 uploaded = load_workbook_scores(upload, "professor_7")
 
-staged = stage_data_dir(uploaded, os.path.join(tmp, "staged"), base)
+staged = stage_data_dir(uploaded, os.path.join(tmp, "staged"))
 merged = load_all(os.path.join(staged, "cucei_scores.csv"), os.path.join(staged, "cucei"))
 assert list(merged["professor_id"].unique()) == ["professor_7"], merged
 assert abs(merged["mean"].iloc[0] - upload_mean) < 1e-9
-assert os.path.isdir(os.path.join(staged, "golden", "lec1"))
 assert cucei_profile("professor_7", staged)[0]["mean"] == merged["mean"].iloc[0]
-assert os.path.isdir(os.path.join(stage_data_dir(uploaded, os.path.join(tmp, "s2"), None)))
-print("ok  staged upload holds only that professor's scores (+ golden), none from data/")
+print("ok  staged upload holds only that professor's scores, none from data/")
 
 print("\nAll feedback report tests passed.")

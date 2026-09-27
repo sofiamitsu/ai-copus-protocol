@@ -1,13 +1,12 @@
 """
 Data for the Faculty Feedback Report sections added on 2026-09-19 (Change 9):
-CUCEI perception profile, golden-aggregate comparison, and behavior-perception
+CUCEI perception profile, per-lecture golden reference comparisons, and behavior-perception
 linking observations. Layout lives in report/pdf_report.py; this module only
 computes what those sections say.
 
 Every section degrades to a clearly-labelled placeholder when its input is not
-there yet (no cucei_scores.csv, no golden outputs), so the report always builds.
+there yet (no CUCEI scores, no golden lectures), so the report always builds.
 """
-import glob
 import os
 
 import pandas as pd
@@ -92,35 +91,55 @@ def code_shares(results_df):
 
 
 # --------------------------------------------------------------------------- #
-# Golden aggregate
+# Golden reference lectures
 # --------------------------------------------------------------------------- #
-def golden_profile(data_dir=DEFAULT_DATA_DIR):
-    """
-    The golden-aggregate behavioral profile, or None if no golden outputs exist.
+DEFAULT_GOLDEN_DIR = os.path.join(REPO_ROOT, "golden")
+GOLDEN_MANIFEST = "golden_lectures.csv"
+GOLDEN_RESULTS = "results_multimodal.csv"
 
-    Pools every results_multimodal.csv under <data_dir>/golden/ and computes the
-    same "% of windows" measure as the professor's own profile, so the two are
-    directly comparable (both AI multimodal coding, both window-weighted).
 
-    Returns {"shares": {code: pct}, "n_lectures": int, "n_windows": int,
-             "results": pooled DataFrame}.
+def golden_lectures(golden_dir=DEFAULT_GOLDEN_DIR):
     """
-    paths = sorted(glob.glob(os.path.join(data_dir, "golden", "**",
-                                          "results_multimodal.csv"), recursive=True))
-    frames = []
-    for p in paths:
+    One behavioral profile per golden reference lecture, in manifest order, or []
+    if none are available.
+
+    Each golden lecture is by a different instructor, so they are NEVER pooled:
+    the report compares the professor with each one separately. Lectures come
+    from <golden_dir>/golden_lectures.csv (folder, professor_name, lecture_title,
+    youtube_url); a results folder not listed there is ignored, so every
+    comparison carries a name and a link the professor can follow.
+
+    Shares use the same "% of windows" measure as the professor's own profile,
+    so the two are directly comparable (both AI multimodal coding).
+
+    Returns [{"professor_name", "lecture_title", "youtube_url", "shares",
+              "n_windows", "results"}].
+    """
+    manifest = os.path.join(golden_dir, GOLDEN_MANIFEST)
+    if not os.path.exists(manifest):
+        return []
+    rows = pd.read_csv(manifest, dtype=str).fillna("")
+    out = []
+    for _, row in rows.iterrows():
+        folder = row.get("folder", "").strip()
+        path = os.path.join(golden_dir, folder, GOLDEN_RESULTS)
         try:
-            df = pd.read_csv(p)
+            df = pd.read_csv(path)
         except Exception as e:  # noqa: BLE001 -- one bad file must not sink the report
-            print(f"[warn] skipping golden file {p}: {e}")
+            print(f"[warn] skipping golden lecture '{folder}': {e}")
             continue
-        if not df.empty:
-            frames.append(df)
-    if not frames:
-        return None
-    pooled = pd.concat(frames, ignore_index=True)
-    return {"shares": code_shares(pooled), "n_lectures": len(frames),
-            "n_windows": len(pooled), "results": pooled}
+        if df.empty:
+            print(f"[warn] skipping golden lecture '{folder}': {path} has no windows")
+            continue
+        out.append({
+            "professor_name": row.get("professor_name", "").strip(),
+            "lecture_title": row.get("lecture_title", "").strip(),
+            "youtube_url": row.get("youtube_url", "").strip(),
+            "shares": code_shares(df),
+            "n_windows": len(df),
+            "results": df,
+        })
+    return out
 
 
 # --------------------------------------------------------------------------- #
