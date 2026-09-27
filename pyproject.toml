@@ -1,7 +1,7 @@
 [project]
 name = "thesis"
 version = "0.1.0"
-description = "Add your description here"
+description = "Automated COPUS classroom observation: Gemini-based coding of lecture video, validated against human observers"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
