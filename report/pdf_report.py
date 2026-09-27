@@ -1,5 +1,5 @@
 """
-Phase 9 — Faculty Feedback Report (PDF).
+Faculty Feedback Report (PDF).
 
 The IRB protocol promises each participating instructor a "Faculty Feedback
 Report": a concrete, actionable summary that translates the COPUS AI analysis
@@ -929,7 +929,7 @@ def _discover_lectures(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 9 — build a Faculty Feedback Report PDF from a "
+        description="Build a Faculty Feedback Report PDF from a "
                     "run.py output directory.")
     parser.add_argument("--output-dir", required=True,
                         help="run.py output dir, e.g. output/dr_smith")

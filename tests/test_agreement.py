@@ -2,10 +2,10 @@
 Acceptance tests for per-code agreement: prevalence, % agreement, Gwet's AC1,
 threshold-count summary rows, and per_code_errors.csv (no API calls, no cost).
 
-    uv run python test_agreement.py
+    uv run python -m tests.test_agreement
 
 Optional cross-check against Gwet's own implementation, if irrCAC is importable:
-    PYTHONPATH=/path/to/irrCAC uv run python test_agreement.py
+    PYTHONPATH=/path/to/irrCAC uv run python -m tests.test_agreement
 """
 import os
 import tempfile

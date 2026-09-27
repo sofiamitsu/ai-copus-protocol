@@ -1,5 +1,5 @@
 """
-Phase 6b — ablation deltas (thesis Table 6.2).
+Ablation deltas (thesis Table 6.2).
 
 Reads a `comparison_table.csv` written by validate.validator.compute_comparison_table
 and reports, per COPUS code, how much agreement CHANGES when the multimodal arm is
@@ -35,9 +35,9 @@ n_human_marked, and the per-arm n_ai_marked counts. A large delta on a code with
 n_human_marked = 1 is not a modality effect, it is one window.
 
 Usage:
-    uv run python compute_ablation_deltas.py \
+    uv run python -m scripts.compute_ablation_deltas \
       --comparison-table output/ablation_study/comparison_table.csv
-    uv run python compute_ablation_deltas.py \
+    uv run python -m scripts.compute_ablation_deltas \
       --comparison-table .../comparison_table.csv --output .../ablation_deltas.csv
 """
 import argparse

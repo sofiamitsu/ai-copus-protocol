@@ -1,5 +1,5 @@
 """
-Phase 6 — Full Ablation Validation batch runner.
+run_ablation.py — ablation study runner (all 4 modality arms).
 
 Runs all 4 classification arms across one or more ground-truth lectures, then
 produces the cross-arm Cohen's κ comparison table and comparison dashboards.
@@ -16,7 +16,10 @@ Usage:
       --lecture-ids lecture_001 lecture_002 \
       --output-dir output/ablation_study \
       [--windows 0,1,2,3] [--model gemini-2.5-pro] \
-      [--max-chunks N] [--window-seconds 120]
+      [--max-chunks N] [--window-seconds 120] [--workers 8]
+
+Lectures, arms and windows all run in parallel; --workers caps how many Gemini
+requests are in flight at once.
 
 Human ground truth is expected at human_coding_{lecture_id}.csv (repo root by
 default; override with --human-dir). Validation is skipped per-lecture if its
@@ -24,22 +27,24 @@ human CSV is missing.
 """
 import argparse
 import os
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
-from chunk.chunker import chunk_video
-from classify.classifier import DEFAULT_MODEL, VALID_MODELS
-from run import chunks_missing
-from test_pipeline import ARM_CONFIG, MAX_ATTEMPTS, run_arm
+from classify.classifier import DEFAULT_MODEL, VALID_MODELS, set_max_concurrency
+from classify.runner import ARM_CONFIG, DEFAULT_WORKERS, MAX_ATTEMPTS, run_arms
+from run import ensure_chunks, format_elapsed, parse_windows, run_parallel
 from validate.validator import compute_comparison_table, load_human_codes
 from report.dashboard import generate_comparison_dashboard
 from utils.professor_ids import resolve_professor, upsert_mapping
 
 
 def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_seconds,
-                    window_indices=None, model=DEFAULT_MODEL, professor_id=None):
+                    window_indices=None, model=DEFAULT_MODEL, professor_id=None,
+                    workers=DEFAULT_WORKERS):
     """
-    Chunk + run all 4 arms for one lecture, on identical chunk indices.
+    Chunk + run all 4 arms for one lecture (in parallel), on identical chunk
+    indices.
     Returns ({arm: results_csv}, indices_processed, professor_id).
     """
     lecture_dir = os.path.join(output_dir, lecture_id)
@@ -56,33 +61,25 @@ def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_sec
     else:
         indices = None  # run_arm derives it from what is on disk
 
-    missing = chunks_missing(chunks_dir, indices)
-    if not missing:
-        print(f"Chunks already exist in {chunks_dir}, skipping chunking")
-    else:
-        print(f"=== Chunking ({len(missing)} window(s) to cut) ===")
-        chunk_video(
-            input_path=lecture_path,
-            output_dir=chunks_dir,
-            window_seconds=window_seconds,
-            chunk_indices=indices,
-        )
+    ensure_chunks(lecture_path, chunks_dir, indices, window_seconds,
+                  tag=f"[{lecture_id}]")
+
+    arm_results = run_arms(
+        list(ARM_CONFIG),
+        workers=workers,
+        lecture_dir=lecture_dir,
+        chunks_dir=chunks_dir,
+        lecture_id=lecture_id,
+        window_indices=indices,
+        window_seconds=window_seconds,
+        model=model,
+        professor_id=professor_id,
+    )
 
     arm_csvs = {}
     retries = {}
     processed_indices = None
-    for arm_name in ARM_CONFIG:
-        result = run_arm(
-            arm_name,
-            chunks_dir=chunks_dir,
-            results_dir=os.path.join(lecture_dir, f"results_{arm_name}"),
-            output_csv=os.path.join(lecture_dir, f"results_{arm_name}.csv"),
-            lecture_id=lecture_id,
-            window_indices=indices,
-            window_seconds=window_seconds,
-            model=model,
-            professor_id=professor_id,
-        )
+    for arm_name, result in arm_results.items():
         arm_csvs[arm_name] = result["csv"]
         retries[arm_name] = result["retries"]
         # Every arm must cover the same windows or the κ columns aren't comparable.
@@ -98,7 +95,7 @@ def process_lecture(lecture_path, lecture_id, output_dir, max_chunks, window_sec
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 6 ablation batch runner")
+    parser = argparse.ArgumentParser(description="Run all 4 modality arms and compare them against human coding")
     parser.add_argument("--lectures", nargs="+", required=True,
                         help="Lecture .mp4 paths")
     parser.add_argument("--lecture-ids", nargs="+", required=True,
@@ -119,6 +116,10 @@ def main():
     parser.add_argument("--model", choices=VALID_MODELS, default=DEFAULT_MODEL,
                         help=f"Gemini model for classification (default: {DEFAULT_MODEL})")
     parser.add_argument("--window-seconds", type=int, default=120)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help="Max Gemini requests in flight at once, across all "
+                             f"lectures and arms (default: {DEFAULT_WORKERS}; "
+                             "1 = sequential). Lower it if you hit 429 rate limits.")
     args = parser.parse_args()
 
     if len(args.lectures) != len(args.lecture_ids):
@@ -135,16 +136,10 @@ def main():
             f"({len(args.lectures)}) must have the same length"
         )
 
-    window_indices = None
-    if args.windows is not None:
-        try:
-            window_indices = sorted({int(w) for w in args.windows.split(",") if w.strip()})
-        except ValueError:
-            parser.error(f"--windows must be comma-separated integers, got: {args.windows}")
-        if not window_indices:
-            parser.error("--windows was empty")
-        if window_indices[0] < 0:
-            parser.error(f"--windows must be non-negative, got {window_indices[0]}")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    window_indices = (parse_windows(parser, args.windows)
+                      if args.windows is not None else None)
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Arms: {list(ARM_CONFIG)}")
@@ -152,20 +147,26 @@ def main():
     if window_indices is not None:
         print(f"Windows: {len(window_indices)} sparse chunks "
               f"({window_indices[0]}..{window_indices[-1]})")
+    print(f"Parallel Gemini requests: {args.workers}")
     print(f"Output: {args.output_dir}")
 
+    started = time.monotonic()
+    set_max_concurrency(args.workers)
     per_lecture_arm_csvs = {}
     per_lecture_indices = {}
     per_lecture_prof = {}
     per_lecture_retries = {}
     prof_ids = args.professor_ids or [None] * len(args.lectures)
-    for lecture_path, lecture_id, prof_id in zip(args.lectures, args.lecture_ids, prof_ids):
-        arm_csvs, indices, prof_id, retries = process_lecture(
-            lecture_path, lecture_id, args.output_dir,
-            args.max_chunks, args.window_seconds,
-            window_indices=window_indices, model=args.model,
-            professor_id=prof_id,
-        )
+    outcomes = run_parallel(process_lecture, [
+        dict(lecture_path=lecture_path, lecture_id=lecture_id,
+             output_dir=args.output_dir, max_chunks=args.max_chunks,
+             window_seconds=args.window_seconds, window_indices=window_indices,
+             model=args.model, professor_id=prof_id, workers=args.workers)
+        for lecture_path, lecture_id, prof_id
+        in zip(args.lectures, args.lecture_ids, prof_ids)
+    ])
+    for lecture_id, (arm_csvs, indices, prof_id, retries) in zip(args.lecture_ids,
+                                                                  outcomes):
         per_lecture_arm_csvs[lecture_id] = arm_csvs
         per_lecture_indices[lecture_id] = indices
         per_lecture_prof[lecture_id] = prof_id
@@ -238,7 +239,8 @@ def main():
         if still:
             line += f": {still}"
         print(line)
-    print(f"\nAblation study complete. Model: {args.model}")
+    print(f"\nAblation study complete. Model: {args.model}. "
+          f"Wall time: {format_elapsed(time.monotonic() - started)}")
 
 
 if __name__ == "__main__":

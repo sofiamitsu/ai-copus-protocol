@@ -1,5 +1,8 @@
 import os
 import json
+import threading
+from contextlib import contextmanager
+
 from google import genai
 from google.genai import types
 
@@ -36,6 +39,25 @@ GENERATION_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "0"))
 GENERATION_SEED = int(os.environ.get("GEMINI_SEED", "20260922"))
 
 
+# Cap on Gemini requests in flight at once, across every thread in the process.
+# The runner parallelises windows, arms and lectures; this is the single knob that
+# keeps the total inside Vertex quota however those are combined.
+_api_slots = threading.BoundedSemaphore(8)
+
+
+def set_max_concurrency(n):
+    """Allow at most n concurrent Gemini requests (call before a run starts)."""
+    global _api_slots
+    _api_slots = threading.BoundedSemaphore(max(1, int(n)))
+
+
+@contextmanager
+def _api_slot():
+    slots = _api_slots
+    with slots:
+        yield
+
+
 def generation_config():
     """Decoding settings shared by every classification and transcription call."""
     return types.GenerateContentConfig(
@@ -62,8 +84,9 @@ def get_gemini_client():
 def _call_gemini_and_parse(client, contents, chunk_index, output_dir=None,
                             window_start=None, window_end=None,
                             model=DEFAULT_MODEL, extra_metadata=None):
-    response = client.models.generate_content(
-        model=model, contents=contents, config=generation_config())
+    with _api_slot():
+        response = client.models.generate_content(
+            model=model, contents=contents, config=generation_config())
 
     # Clean the response (strip markdown code fences if present)
     raw = response.text.strip()
@@ -90,15 +113,12 @@ def _call_gemini_and_parse(client, contents, chunk_index, output_dir=None,
     if extra_metadata:
         result.update(extra_metadata)
 
-    print(f"Chunk {chunk_index}: {result.get('codes_present')}")
-
     # Save to JSON file if output_dir provided
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, f"chunk_{chunk_index:03d}_result.json")
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
-        print(f"  Saved -> {out_path}")
 
     return result
 
@@ -256,55 +276,45 @@ PROMPT_TRANSCRIBE = """Transcribe this audio clip verbatim. Return only the tran
 nothing else."""
 
 
-def classify_chunk_multimodal(video_path, chunk_index, output_dir=None,
-                               window_start=None, window_end=None,
-                               model=DEFAULT_MODEL):
+def _classify_media(path, mime_type, chunk_index, output_dir, window_start,
+                    window_end, model):
+    """Classify one chunk from its raw media (video or audio) + the unified prompt."""
     client = get_gemini_client()
 
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
+    with open(path, "rb") as f:
+        media_bytes = f.read()
 
     contents = [
-        types.Part.from_bytes(data=video_bytes, mime_type="video/mp4"),
+        types.Part.from_bytes(data=media_bytes, mime_type=mime_type),
         types.Part.from_text(text=PROMPT_COPUS_UNIFIED),
     ]
 
     return _call_gemini_and_parse(client, contents, chunk_index, output_dir,
                                   window_start, window_end, model=model)
+
+
+def classify_chunk_multimodal(video_path, chunk_index, output_dir=None,
+                              window_start=None, window_end=None,
+                              model=DEFAULT_MODEL):
+    """Video with its audio track (chunk_NNN_full.mp4)."""
+    return _classify_media(video_path, "video/mp4", chunk_index, output_dir,
+                           window_start, window_end, model)
 
 
 def classify_chunk_vision_only(video_path, chunk_index, output_dir=None,
-                                window_start=None, window_end=None,
-                                model=DEFAULT_MODEL):
-    client = get_gemini_client()
-
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-
-    contents = [
-        types.Part.from_bytes(data=video_bytes, mime_type="video/mp4"),
-        types.Part.from_text(text=PROMPT_COPUS_UNIFIED),
-    ]
-
-    return _call_gemini_and_parse(client, contents, chunk_index, output_dir,
-                                  window_start, window_end, model=model)
+                               window_start=None, window_end=None,
+                               model=DEFAULT_MODEL):
+    """Silent video (chunk_NNN_muted.mp4) -- same call, the audio is gone."""
+    return _classify_media(video_path, "video/mp4", chunk_index, output_dir,
+                           window_start, window_end, model)
 
 
 def classify_chunk_audio_only(audio_path, chunk_index, output_dir=None,
-                               window_start=None, window_end=None,
-                               model=DEFAULT_MODEL):
-    client = get_gemini_client()
-
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    contents = [
-        types.Part.from_bytes(data=audio_bytes, mime_type="audio/mpeg"),
-        types.Part.from_text(text=PROMPT_COPUS_UNIFIED),
-    ]
-
-    return _call_gemini_and_parse(client, contents, chunk_index, output_dir,
-                                  window_start, window_end, model=model)
+                              window_start=None, window_end=None,
+                              model=DEFAULT_MODEL):
+    """Audio only (chunk_NNN_audio.mp3)."""
+    return _classify_media(audio_path, "audio/mpeg", chunk_index, output_dir,
+                           window_start, window_end, model)
 
 
 def classify_chunk_transcript_only(audio_path, chunk_index, output_dir=None,
@@ -321,11 +331,12 @@ def classify_chunk_transcript_only(audio_path, chunk_index, output_dir=None,
         types.Part.from_bytes(data=audio_bytes, mime_type="audio/mpeg"),
         types.Part.from_text(text=PROMPT_TRANSCRIBE),
     ]
-    transcribe_response = client.models.generate_content(
-        model=TRANSCRIBE_MODEL,
-        contents=transcribe_contents,
-        config=generation_config(),
-    )
+    with _api_slot():
+        transcribe_response = client.models.generate_content(
+            model=TRANSCRIBE_MODEL,
+            contents=transcribe_contents,
+            config=generation_config(),
+        )
     raw_transcript = transcribe_response.text.strip()
 
     # Step 2: scrub PII locally (Presidio, no network call).

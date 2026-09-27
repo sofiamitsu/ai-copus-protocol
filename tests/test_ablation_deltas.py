@@ -1,14 +1,14 @@
 """
 Acceptance tests for compute_ablation_deltas.py (no API calls, no cost).
 
-    uv run python test_ablation_deltas.py
+    uv run python -m tests.test_ablation_deltas
 """
 import os
 import tempfile
 
 import pandas as pd
 
-from compute_ablation_deltas import compute_deltas, delta
+from scripts.compute_ablation_deltas import compute_deltas, delta
 from validate.convert_copus_sheet import INSTRUCTOR_CODES
 
 # --- Sign convention: negative = ablating hurt ---

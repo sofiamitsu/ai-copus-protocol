@@ -1,7 +1,7 @@
 """
 Acceptance tests for the kappa N/A fix and the MEAN row (no API calls, no cost).
 
-    uv run python test_kappa_na.py
+    uv run python -m tests.test_kappa_na
 """
 from sklearn.metrics import cohen_kappa_score
 

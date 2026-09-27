@@ -1,5 +1,5 @@
 """
-Phase 7 — run.py CLI entry point.
+run.py — command-line entry point for one professor's lectures.
 
 Processes one professor's full data bundle in a single command:
   - 3 lectures (.mp4)
@@ -25,17 +25,24 @@ Usage:
 
 --arm defaults to "multimodal" but accepts "all" to run the full ablation
 study (all 4 modality arms) alongside the primary comparison.
+
+Lectures, arms and windows all run in parallel; --workers caps how many Gemini
+requests are in flight at once (default 8). --workers 1 runs sequentially.
 """
 import argparse
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 from dotenv import load_dotenv
 load_dotenv()
 
 from chunk.chunker import chunk_video
-from classify.classifier import DEFAULT_MODEL, VALID_MODELS
-from test_pipeline import ARM_CONFIG, MAX_ATTEMPTS, run_arm
+from classify.classifier import DEFAULT_MODEL, VALID_MODELS, set_max_concurrency
+from classify.runner import (
+    ARM_CONFIG, DEFAULT_WORKERS, MAX_ATTEMPTS, Cancelled, run_arms,
+)
 from validate.convert_copus_sheet import convert
 from validate.validator import (
     AC1_CLEAR_LABEL,
@@ -80,14 +87,60 @@ def chunks_missing(chunks_dir, window_indices=None):
     ]
 
 
+def ensure_chunks(lecture_path, chunks_dir, indices, window_seconds, tag=""):
+    """Cut whichever of this window set's chunks are not on disk yet (idempotent)."""
+    missing = chunks_missing(chunks_dir, indices)
+    if not missing:
+        print(f"{tag} chunks already exist in {chunks_dir}, skipping chunking")
+        return
+    print(f"=== {tag} chunking ({len(missing)} window(s) to cut) ===")
+    chunk_video(
+        input_path=lecture_path,
+        output_dir=chunks_dir,
+        window_seconds=window_seconds,
+        chunk_indices=indices,
+    )
+
+
+def parse_windows(parser, text):
+    """Parse a --windows value ("0,1,2,...") into sorted unique indices."""
+    try:
+        indices = sorted({int(w) for w in text.split(",") if w.strip()})
+    except ValueError:
+        parser.error(f"--windows must be comma-separated integers, got: {text}")
+    if not indices:
+        parser.error("--windows was empty")
+    if indices[0] < 0:
+        parser.error(f"--windows must be non-negative, got {indices[0]}")
+    return indices
+
+
+def run_parallel(fn, jobs, max_workers=None):
+    """
+    Call fn(**job) for every job concurrently; results come back in job order,
+    so anything pooled afterwards (combined kappa, dashboard offsets) is
+    unaffected by which lecture finished first.
+    """
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers or len(jobs),
+                            thread_name_prefix="lecture") as pool:
+        futures = [pool.submit(fn, **job) for job in jobs]
+        return [f.result() for f in futures]
+
+
 def process_lecture(lecture_path, lecture_id, sofia_xlsx,
                     lecture_dir, arms_to_run, primary_arm,
                     max_chunks, window_seconds,
                     window_indices=None, model=DEFAULT_MODEL,
-                    professor_id=None, professor_name="", course_name=""):
+                    professor_id=None, professor_name="", course_name="",
+                    workers=DEFAULT_WORKERS, cancel_event=None,
+                    on_window_done=None):
     """
-    Run the full per-lecture pipeline. Returns a dict describing this lecture's
-    outputs (arm CSV, human CSV, chunk/error counts) for professor-level pooling.
+    Run the full per-lecture pipeline. Arms run side by side, each classifying
+    up to `workers` windows at once (see classify.runner.run_arm). Returns a
+    dict describing this lecture's outputs (arm CSV, human CSV, chunk/error
+    counts) for professor-level pooling.
 
     professor_id is derived from the lecture's "professor N" folder unless given
     explicitly (see utils.professor_ids.resolve_professor), stamped on every
@@ -110,36 +163,30 @@ def process_lecture(lecture_path, lecture_id, sofia_xlsx,
     else:
         indices = None  # run_arm derives it from what is on disk
 
-    # 1. Chunk (idempotent — cut only what is missing for THIS window set)
-    missing = chunks_missing(chunks_dir, indices)
-    if not missing:
-        print(f"Chunks already exist in {chunks_dir}, skipping chunking")
-    else:
-        print(f"=== Chunking ({len(missing)} window(s) to cut) ===")
-        chunk_video(
-            input_path=lecture_path,
-            output_dir=chunks_dir,
-            window_seconds=window_seconds,
-            chunk_indices=indices,
-        )
+    # 1. Chunk (idempotent — cut only what is missing for THIS window set).
+    # Must finish before classification: every arm reads these same chunks.
+    ensure_chunks(lecture_path, chunks_dir, indices, window_seconds,
+                  tag=f"[{lecture_id}]")
 
-    # 2 + 3. Classify + aggregate each requested arm.
-    arm_csvs = {}
-    arm_results = {}
-    for arm_name in arms_to_run:
-        results_dir = os.path.join(lecture_dir, f"results_{arm_name}")
-        arm_results[arm_name] = run_arm(
-            arm_name,
-            chunks_dir=chunks_dir,
-            results_dir=results_dir,
-            output_csv=os.path.join(lecture_dir, f"results_{arm_name}.csv"),
-            lecture_id=lecture_id,
-            window_indices=indices,
-            window_seconds=window_seconds,
-            model=model,
-            professor_id=professor_id,
-        )
-        arm_csvs[arm_name] = arm_results[arm_name]["csv"]
+    # 2 + 3. Classify + aggregate every requested arm, in parallel.
+    arm_results = run_arms(
+        arms_to_run,
+        workers=workers,
+        lecture_dir=lecture_dir,
+        chunks_dir=chunks_dir,
+        lecture_id=lecture_id,
+        window_indices=indices,
+        window_seconds=window_seconds,
+        model=model,
+        professor_id=professor_id,
+        cancel_event=cancel_event,
+        on_window_done=on_window_done,
+    )
+    arm_csvs = {arm: r["csv"] for arm, r in arm_results.items()}
+    if cancel_event is not None and cancel_event.is_set():
+        # Partial results stay on disk (a rerun reuses them), but scoring a
+        # half-classified lecture would only produce misleading kappas.
+        raise Cancelled(lecture_id)
 
     primary = arm_results[primary_arm]
     primary_csv = primary["csv"]
@@ -166,7 +213,7 @@ def process_lecture(lecture_path, lecture_id, sofia_xlsx,
     # 5. Kappa for this lecture.
     # The HUMAN csv must be csv_a: compute_kappa names its count columns
     # human_positive_windows / ai_positive_windows after csv_a / csv_b, so
-    # passing the AI csv first silently swaps them (see compute_baseline_kappa.py).
+    # passing the AI csv first silently swaps them (see scripts/compute_baseline_kappa.py).
     # Kappa itself is symmetric; only the two count columns depend on the order.
     print("\n=== Validation: AI vs Sofia ===")
     compute_kappa(human_sofia, primary_csv, lecture_dir,
@@ -366,8 +413,14 @@ def analyze_survey(survey_csv, output_csv):
     print(f"\nSurvey analysis saved → {output_csv} ({len(rows)} questions)")
 
 
+def format_elapsed(seconds):
+    m, s = divmod(int(round(seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Phase 7 professor-bundle runner")
+    parser = argparse.ArgumentParser(description="Run the COPUS pipeline on one professor's lectures")
     parser.add_argument("--professor", required=True, help="Professor name (label only)")
     parser.add_argument("--professor-id", default=None,
                         help="e.g. professor_1. Default: derived from the lectures' "
@@ -391,21 +444,19 @@ def main():
     parser.add_argument("--model", choices=VALID_MODELS, default=DEFAULT_MODEL,
                         help=f"Gemini model for classification (default: {DEFAULT_MODEL})")
     parser.add_argument("--window-seconds", type=int, default=WINDOW_SECONDS)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help="Max Gemini requests in flight at once, across all "
+                             f"lectures and arms (default: {DEFAULT_WORKERS}; "
+                             "1 = sequential). Lower it if you hit 429 rate limits.")
     args = parser.parse_args()
 
     if args.windows is not None and args.max_chunks is not None:
         parser.error("--windows and --max-chunks are mutually exclusive; "
                      "--windows already names exactly which chunks to process.")
-    window_indices = None
-    if args.windows is not None:
-        try:
-            window_indices = sorted({int(w) for w in args.windows.split(",") if w.strip()})
-        except ValueError:
-            parser.error(f"--windows must be comma-separated integers, got: {args.windows}")
-        if not window_indices:
-            parser.error("--windows was empty")
-        if window_indices[0] < 0:
-            parser.error(f"--windows must be non-negative, got {window_indices[0]}")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    window_indices = (parse_windows(parser, args.windows)
+                      if args.windows is not None else None)
 
     # All per-lecture list args must be the same length.
     n_lectures = len(args.lectures)
@@ -431,13 +482,13 @@ def main():
     if window_indices is not None:
         print(f"Windows: {len(window_indices)} sparse chunks "
               f"({window_indices[0]}..{window_indices[-1]})")
+    print(f"Parallel Gemini requests: {args.workers}")
     print(f"Output: {args.output_dir}")
 
-    lecture_infos = []
-    for lecture_path, lecture_id, sofia_xlsx in zip(
-        args.lectures, args.lecture_ids, args.sofia_coding
-    ):
-        info = process_lecture(
+    started = time.monotonic()
+    set_max_concurrency(args.workers)
+    lecture_infos = run_parallel(process_lecture, [
+        dict(
             lecture_path=lecture_path,
             lecture_id=lecture_id,
             sofia_xlsx=sofia_xlsx,
@@ -451,8 +502,11 @@ def main():
             professor_id=args.professor_id,
             professor_name=args.professor,
             course_name=args.course,
+            workers=args.workers,
         )
-        lecture_infos.append(info)
+        for lecture_path, lecture_id, sofia_xlsx in zip(
+            args.lectures, args.lecture_ids, args.sofia_coding)
+    ])
 
     # 7. Combined kappa across all lectures.
     print("\n========== Professor-level outputs ==========")
@@ -484,6 +538,7 @@ def main():
     print(f"Windows processed: {total_processed}/{total_attempted} "
           f"(primary arm: {primary_arm})")
     print(f"Failed/skipped windows: {total_errors}")
+    print(f"Wall time: {format_elapsed(time.monotonic() - started)}")
 
     # Retry statistics, per arm, across every lecture. A window that stays failed
     # after MAX_ATTEMPTS is dropped from EVERY arm's comparison table, so these
