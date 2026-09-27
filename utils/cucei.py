@@ -30,7 +30,6 @@ survey's own R_/N_ labels. The final scores are produced and checked by hand.)
 import glob
 import os
 import re
-import shutil
 import statistics
 
 import pandas as pd
@@ -194,27 +193,18 @@ def load_workbook_dir(workbook_dir=DEFAULT_WORKBOOK_DIR):
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
-def stage_data_dir(scores, dest_dir, base_data_dir=_DATA_DIR):
+def stage_data_dir(scores, dest_dir):
     """
     Build a report data dir at dest_dir for one run: this professor's CUCEI
     scores (a DataFrame from load_workbook_scores, e.g. the Streamlit upload)
     and nothing else from CUCEI -- no other professor's workbook or CSV row is
-    copied, so the run cannot show or depend on anyone else's scores. golden/
-    (reference-lecture behavior, no CUCEI) is linked from base_data_dir when
-    present. Returns dest_dir.
+    copied, so the run cannot show or depend on anyone else's scores. Returns
+    dest_dir.
 
     Scores are written as CSV rows, so the uploaded file's name does not have to
     carry the professor number.
     """
-    os.makedirs(dest_dir, exist_ok=True)
-    if base_data_dir and os.path.isdir(base_data_dir):
-        golden = os.path.join(base_data_dir, "golden")
-        dest_golden = os.path.join(dest_dir, "golden")
-        if os.path.isdir(golden) and not os.path.exists(dest_golden):
-            try:
-                os.symlink(golden, dest_golden, target_is_directory=True)
-            except OSError:  # e.g. Windows without symlink rights
-                shutil.copytree(golden, dest_golden)
+    os.makedirs(os.path.join(dest_dir, "cucei"), exist_ok=True)
     scores[REQUIRED_COLUMNS].to_csv(
         os.path.join(dest_dir, "cucei_scores.csv"), index=False)
     return dest_dir
