@@ -20,8 +20,9 @@ def generate_report(output_dir, pdf_path, meta, data_dir=None):
     `meta` is the dict app.py keeps in `st.session_state.meta`:
         {"professor": ..., "course": ..., "semester": ..., "arm": ..., "primary_arm": ...}
 
-    `data_dir` holds cucei/, cucei_scores.csv and golden/ (default: the repo's
-    data/). The app passes a per-run dir when CUCEI workbooks were uploaded.
+    `data_dir` holds cucei/ and cucei_scores.csv (default: the repo's data/).
+    The app passes a per-run dir when a CUCEI workbook was uploaded. Golden
+    reference lectures always come from the repo's golden/.
     """
     lecture_results = _discover_lectures(output_dir)
     if not lecture_results:
