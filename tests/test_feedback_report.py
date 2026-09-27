@@ -2,7 +2,7 @@
 Acceptance tests for the Faculty Feedback Report rebuild (Change 9) and the
 CUCEI score loader. No API calls: the Gemini narrative is stubbed out.
 
-    uv run python test_feedback_report.py
+    uv run python -m tests.test_feedback_report
 """
 import os
 import tempfile

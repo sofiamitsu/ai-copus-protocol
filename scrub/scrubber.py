@@ -1,3 +1,5 @@
+import threading
+
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
@@ -7,6 +9,11 @@ _ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION", "US_SSN", "C
 
 _analyzer = None
 _anonymizer = None
+# Transcript-arm windows run on parallel threads. The lock covers the one-time
+# engine load (a race would load spaCy twice) and each scrub, since spaCy
+# pipelines are not guaranteed thread-safe. Scrubbing is local and takes
+# milliseconds, so serialising it costs nothing next to the API calls.
+_lock = threading.Lock()
 
 
 def _get_engines():
@@ -30,8 +37,9 @@ def scrub_transcript(text: str) -> str:
     if not text:
         return text
 
-    analyzer, anonymizer = _get_engines()
-    results = analyzer.analyze(text=text, entities=_ENTITIES, language="en")
     operators = {entity: OperatorConfig("replace", {"new_value": "[REDACTED]"}) for entity in _ENTITIES}
-    anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
+    with _lock:
+        analyzer, anonymizer = _get_engines()
+        results = analyzer.analyze(text=text, entities=_ENTITIES, language="en")
+        anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
     return anonymized.text

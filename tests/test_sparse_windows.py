@@ -1,7 +1,7 @@
 """
 Acceptance tests for utils.sparse_windows (no API calls, no cost).
 
-    uv run python test_sparse_windows.py
+    uv run python -m tests.test_sparse_windows
 """
 import math
 

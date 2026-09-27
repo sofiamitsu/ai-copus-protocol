@@ -1,5 +1,5 @@
 """
-Phase 9 smoke test — builds a Faculty Feedback Report PDF from existing
+Smoke test — builds a Faculty Feedback Report PDF from existing
 pipeline_test / ablation_study outputs and asserts the file is a valid,
 multi-page PDF. Runs without Gemini credentials (narrative falls back to the
 deterministic data-driven summary).
@@ -65,4 +65,4 @@ def test_full_report():
 if __name__ == "__main__":
     test_helpers()
     test_full_report()
-    print("\nAll Phase 9 tests passed.")
+    print("\nAll PDF report tests passed.")

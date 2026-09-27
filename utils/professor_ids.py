@@ -18,11 +18,15 @@ Resolution order (see resolve_professor):
 """
 import os
 import re
+import threading
 
 import pandas as pd
 
 MAPPING_FILENAME = "lecture_professor_mapping.csv"
 MAPPING_COLUMNS = ["lecture_id", "professor_id", "professor_name", "course_name"]
+
+# Lectures run in parallel and all read-modify-write the same mapping file.
+_mapping_lock = threading.Lock()
 
 # "PROFESSOR 1 (DR RODRIGO)", "professor 8", "Professor_3", "prof-2 (Dr. X)"
 _FOLDER_RE = re.compile(
@@ -92,6 +96,13 @@ def upsert_mapping(output_dir, lecture_id, professor_id, professor_name="",
     Keyed on lecture_id, so lecture ids must be unique across professors --
     two professors' "lecture_1" would overwrite each other here.
     """
+    with _mapping_lock:
+        return _upsert_mapping(output_dir, lecture_id, professor_id,
+                               professor_name, course_name)
+
+
+def _upsert_mapping(output_dir, lecture_id, professor_id, professor_name,
+                    course_name):
     path = os.path.join(output_dir, MAPPING_FILENAME)
     row = {"lecture_id": lecture_id, "professor_id": professor_id,
            "professor_name": professor_name or "", "course_name": course_name or ""}

@@ -1,7 +1,7 @@
 """
-Phase 8 — Streamlit UI for the COPUS pipeline.
+Streamlit UI for the COPUS pipeline.
 
-A local web front end (localhost:8501) wrapping the Phase 7 CLI. It saves
+A local web front end (localhost:8501) wrapping the run.py CLI. It saves
 uploaded files to a temp dir, then calls the SAME functions the CLI uses
 (`process_lecture`, `build_combined_kappa`, `build_professor_dashboard`
 from run.py) — no pipeline logic is re-implemented here.
@@ -9,7 +9,9 @@ from run.py) — no pipeline logic is re-implemented here.
 Run with:  uv run streamlit run app.py
 
 The pipeline runs in a background thread so the UI can stream log output,
-show a live progress bar, and offer a Cancel button while it works.
+show a live progress bar, and offer a Cancel button while it works. Inside that
+thread lectures, arms and windows run in parallel, capped by the sidebar's
+"Parallel requests" setting.
 """
 import io
 import math
@@ -27,16 +29,19 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from classify.classifier import DEFAULT_MODEL, VALID_MODELS
+from classify.classifier import DEFAULT_MODEL, VALID_MODELS, set_max_concurrency
+from classify.runner import ARM_CONFIG, DEFAULT_WORKERS, Cancelled
+from report.faculty_report import generate_report
 from validate.validator import SUMMARY_LABELS
 from utils.cucei import load_workbook_scores, professor_id_from_filename, stage_data_dir
 from utils.professor_ids import parse_professor_folder, slug as professor_slug
 from utils.sparse_windows import plan_sparse_windows, probe_duration_minutes, write_template
 from run import (
-    ARM_CONFIG,
-    process_lecture,
     build_combined_kappa,
     build_professor_dashboard,
+    format_elapsed,
+    process_lecture,
+    run_parallel,
 )
 
 WINDOW_SECONDS = 120
@@ -71,6 +76,8 @@ class PipelineRunner:
         self._lock = threading.Lock()
         self._progress = 0.0
         self._status = "Starting…"
+        self._windows_done = 0
+        self._windows_total = 1
         self.error = None
         self.cancelled = False
         self.result = None
@@ -89,11 +96,24 @@ class PipelineRunner:
             self._progress = p
             self._status = s
 
+    def _window_done(self):
+        """One (lecture, arm, window) resolved -- drives the progress bar."""
+        with self._lock:
+            self._windows_done += 1
+            done, total = self._windows_done, self._windows_total
+            # Classification is ~all the run time; keep the last 5% for rollup.
+            self._progress = 0.95 * min(done / total, 1.0)
+            self._status = f"Classified {done}/{total} windows…"
+
     def _run(self):
         writer = _QueueWriter(self.log_queue)
         try:
             with contextlib.redirect_stdout(writer):
                 self._pipeline()
+        except Cancelled:
+            self.cancelled = True
+            self.log_queue.put("\n[CANCELLED] stopped; partial results are kept "
+                               "and reused if you run again with the same inputs\n")
         except Exception as e:  # never crash the UI
             self.error = f"{type(e).__name__}: {e}"
             self.log_queue.put(f"\n[FATAL] {self.error}\n")
@@ -102,18 +122,17 @@ class PipelineRunner:
 
     def _pipeline(self):
         cfg = self.config
-        lectures = cfg["lectures"]  # list of (path, id, sofia, windows)
-        n = len(lectures)
-        total_steps = n + 1  # per-lecture work + professor-level rollup
+        lectures = cfg["lectures"]  # list of (path, id, sofia, windows, n_windows)
+        workers = cfg.get("workers", DEFAULT_WORKERS)
+        started = time.monotonic()
+        with self._lock:
+            self._windows_total = max(1, len(cfg["arms_to_run"]) *
+                                      sum(n for *_, n in lectures))
+        self._set(0.0, f"Processing {len(lectures)} lecture(s) in parallel…")
+        set_max_concurrency(workers)
 
-        lecture_infos = []
-        for i, (path, lid, sofia, windows) in enumerate(lectures):
-            if self.cancel_event.is_set():
-                self.cancelled = True
-                self.log_queue.put(f"\n[CANCELLED] stopped before {lid}\n")
-                return
-            self._set(i / total_steps, f"Processing {lid} ({i + 1}/{n})…")
-            info = process_lecture(
+        lecture_infos = run_parallel(process_lecture, [
+            dict(
                 lecture_path=path,
                 lecture_id=lid,
                 sofia_xlsx=sofia,
@@ -131,15 +150,19 @@ class PipelineRunner:
                 professor_id=cfg.get("professor_id") or None,
                 professor_name=cfg.get("professor", ""),
                 course_name=cfg.get("course", ""),
+                workers=workers,
+                cancel_event=self.cancel_event,
+                on_window_done=self._window_done,
             )
-            lecture_infos.append(info)
+            for path, lid, sofia, windows, _ in lectures
+        ])
 
         if self.cancel_event.is_set():
             self.cancelled = True
             self.log_queue.put("\n[CANCELLED] stopped before rollup\n")
             return
 
-        self._set(n / total_steps, "Building professor-level outputs…")
+        self._set(0.96, "Building professor-level outputs…")
         build_combined_kappa(
             lecture_infos, os.path.join(cfg["output_dir"], "combined_kappa.csv")
         )
@@ -150,6 +173,7 @@ class PipelineRunner:
         )
 
         self._set(1.0, "Done")
+        print(f"\nWall time: {format_elapsed(time.monotonic() - started)}")
         self.result = {
             "lecture_infos": lecture_infos,
             "output_dir": cfg["output_dir"],
@@ -246,7 +270,7 @@ def _style_kappa(df):
     # Only per-code rows are agreement values; the trailing codes_clearing_* rows
     # are counts and must not be colored as if 3 were a kappa of 3.
     code_rows = df.index[~df["code"].isin(SUMMARY_LABELS)]
-    return (df.style.applymap(color, subset=(code_rows, cols))
+    return (df.style.map(color, subset=(code_rows, cols))
             .format(na_rep="N/A", subset=cols))
 
 
@@ -266,11 +290,7 @@ def _zip_output(output_dir):
 
 
 def _try_generate_pdf(output_dir, meta, data_dir=None):
-    """Phase 9 hook. Returns a PDF path if the report module exists, else None."""
-    try:
-        from report.faculty_report import generate_report  # built in Phase 9
-    except Exception:
-        return None
+    """Build the Faculty Feedback Report PDF; returns its path, or None on failure."""
     try:
         pdf_path = os.path.join(output_dir, "faculty_feedback_report.pdf")
         generate_report(output_dir, pdf_path, meta, data_dir=data_dir)
@@ -278,6 +298,16 @@ def _try_generate_pdf(output_dir, meta, data_dir=None):
     except Exception as e:
         st.warning(f"PDF generation failed: {e}")
         return None
+
+
+def _lecture_dirs(output_dir):
+    """Per-lecture output folders: any subfolder holding a results_*.csv."""
+    return sorted(
+        d for d in os.listdir(output_dir)
+        if os.path.isdir(os.path.join(output_dir, d))
+        and any(f.startswith("results_") and f.endswith(".csv")
+                for f in os.listdir(os.path.join(output_dir, d)))
+    )
 
 
 def _embed_html(path, height):
@@ -305,7 +335,7 @@ def reset_run():
     tmp = ss.get("temp_dir")
     if tmp and os.path.isdir(tmp):
         shutil.rmtree(tmp, ignore_errors=True)
-    for k in ("runner", "temp_dir", "output_dir", "data_dir"):
+    for k in ("runner", "temp_dir", "output_dir", "data_dir", "pdf_path"):
         ss.pop(k, None)
     ss.stage = "idle"
     ss.logs = ""
@@ -328,6 +358,11 @@ with st.sidebar:
     cap = st.number_input("Max windows per lecture (0 = all)", min_value=0, value=0, step=1,
                           help="Cap 2-min windows per lecture for a quick test run. "
                                "Ignored for lectures that have a window set.")
+    workers = st.number_input(
+        "Parallel requests", min_value=1, max_value=32, value=DEFAULT_WORKERS, step=1,
+        help="How many Gemini requests run at once across all lectures and arms. "
+             "Higher is faster; lower it if the log shows 429 / rate-limit retries. "
+             "1 = fully sequential.")
 
 st.title("🎓 COPUS Classroom Analytics Pipeline")
 st.caption("Runs locally — no video or data leaves this machine.")
@@ -353,7 +388,8 @@ if ss.stage == "running":
 
     if st.button("🛑 Cancel", type="secondary"):
         runner.cancel_event.set()
-        st.info("Cancelling after the current lecture finishes…")
+        st.info("Cancelling — requests already in flight will finish, "
+                "nothing new starts…")
 
     with st.expander("Live log", expanded=True):
         st.code(ss.logs[-6000:] or "…", language="text")
@@ -393,6 +429,7 @@ elif ss.stage == "idle":
     # One block per lecture: its inputs AND its plan render together, so the
     # coding sheet appears directly under the lecture it belongs to.
     lecture_files, lecture_paths, lecture_windows, lecture_ids = {}, {}, {}, {}
+    lecture_durations = {}
     for i in range(3):
         st.markdown(f"### Lecture {i + 1}")
         typed = (st.text_input(
@@ -418,7 +455,6 @@ elif ss.stage == "idle":
                        "to get this lecture's coding sheet.")
             st.divider()
             continue
-        lecture_paths[i] = path
         try:
             with st.spinner(f"Reading lecture {i + 1}…"):
                 duration, indices, scheme, blocks = _lecture_plan(path)
@@ -427,6 +463,9 @@ elif ss.stage == "idle":
                      f"Is it a video ffmpeg can open?")
             st.divider()
             continue
+        # Only a readable lecture counts as present -- the run needs its duration.
+        lecture_paths[i] = path
+        lecture_durations[i] = duration
 
         st.success(f"**{f.name}** · {f.size / 1e9:.2f} GB")
         c1, c2, c3 = st.columns(3)
@@ -563,7 +602,14 @@ elif ss.stage == "idle":
             # Already on disk from the duration probe — don't copy it again.
             lec_path = lecture_paths[i]
             sofia_path = _save_upload(sofia_files[i], inputs, f"{lid}_sofia.xlsx")
-            lectures.append((lec_path, lid, sofia_path, lecture_windows.get(i)))
+            windows = lecture_windows.get(i)
+            if windows:
+                n_windows = len(windows)
+            else:
+                n_windows = math.ceil(lecture_durations[i] / (WINDOW_SECONDS / 60))
+                if cap:
+                    n_windows = min(n_windows, int(cap))
+            lectures.append((lec_path, lid, sofia_path, windows, n_windows))
 
         data_dir = None
         if cucei_scores is not None:
@@ -579,6 +625,7 @@ elif ss.stage == "idle":
             "primary_arm": primary_arm,
             "max_chunks": int(cap) or None,
             "model": model,
+            "workers": int(workers),
             "professor": professor,
             # Stamped on every lecture so the report finds the uploaded scores;
             # None keeps the usual folder / name-slug resolution.
@@ -630,26 +677,15 @@ else:
             else:
                 st.info("No combined κ table found.")
 
-            for lid_dir in sorted(
-                d for d in os.listdir(output_dir)
-                if os.path.isdir(os.path.join(output_dir, d)) and d.startswith("lecture_")
-            ):
-                ld = os.path.join(output_dir, lid_dir)
-                with st.expander(f"{lid_dir} — per-comparison κ"):
-                    for label, fn in (
-                        ("AI vs Sofia", "kappa_ai_vs_sofia.csv"),
-                    ):
-                        fp = os.path.join(ld, fn)
-                        if os.path.exists(fp):
-                            st.markdown(f"*{label}*")
-                            st.dataframe(pd.read_csv(fp), use_container_width=True)
+            for lid_dir in _lecture_dirs(output_dir):
+                fp = os.path.join(output_dir, lid_dir, "kappa_ai_vs_sofia.csv")
+                if os.path.exists(fp):
+                    with st.expander(f"{lid_dir} — AI vs Sofia κ"):
+                        st.dataframe(pd.read_csv(fp), use_container_width=True)
 
         # --- Tab 2: timelines ---
         with tab_t:
-            for lid_dir in sorted(
-                d for d in os.listdir(output_dir)
-                if os.path.isdir(os.path.join(output_dir, d)) and d.startswith("lecture_")
-            ):
+            for lid_dir in _lecture_dirs(output_dir):
                 st.markdown(f"**{lid_dir}**")
                 if not _embed_html(os.path.join(output_dir, lid_dir, "dashboard.html"), 520):
                     st.info("No timeline for this lecture.")
@@ -662,7 +698,12 @@ else:
         st.subheader("Download")
         c1, c2 = st.columns(2)
         with c1:
-            pdf_path = _try_generate_pdf(output_dir, meta, ss.get("data_dir"))
+            # Built once per run: every widget click reruns this page, and the
+            # report calls Gemini for its narratives.
+            if "pdf_path" not in ss:
+                with st.spinner("Building the Faculty Feedback Report…"):
+                    ss.pdf_path = _try_generate_pdf(output_dir, meta, ss.get("data_dir"))
+            pdf_path = ss.pdf_path
             if pdf_path and os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
                     st.download_button(
@@ -671,7 +712,7 @@ else:
                     )
             else:
                 st.button("📥 Faculty Feedback Report (PDF)", disabled=True,
-                          help="Available once Phase 9 (PDF report) is built.")
+                          help="The report could not be built — see the warning above.")
         with c2:
             st.download_button(
                 "📥 Raw Results (ZIP)", _zip_output(output_dir),

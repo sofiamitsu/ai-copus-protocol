@@ -1,5 +1,5 @@
 """
-Thin adapter between the Streamlit UI (app.py) and the Phase 9 PDF builder.
+Thin adapter between the Streamlit UI (app.py) and the PDF builder (report/pdf_report.py).
 
 app.py's `_try_generate_pdf(output_dir, meta)` hook expects a
 `report.faculty_report.generate_report(output_dir, pdf_path, meta)` entry

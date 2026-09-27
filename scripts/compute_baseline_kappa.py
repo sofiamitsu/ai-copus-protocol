@@ -35,8 +35,8 @@ that count and will show alarming values like -0.5 that mean nothing. Judge on
 Lec and RtW, which have real support in this lecture.
 
 RUN:
-    uv run python compute_baseline_kappa.py
-    uv run python compute_baseline_kappa.py --lecture-id sandel \
+    uv run python -m scripts.compute_baseline_kappa
+    uv run python -m scripts.compute_baseline_kappa --lecture-id sandel \
         --results-dir output/sandel/results_multimodal
 """
 

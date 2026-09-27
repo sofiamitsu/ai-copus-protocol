@@ -1,6 +1,12 @@
 import ffmpeg
 import math
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+# ffmpeg processes cutting windows at once. Stream-copy cuts are disk-bound and
+# finish in well under a second each, so a small pool is plenty.
+CHUNK_WORKERS = int(os.environ.get("CHUNK_WORKERS", "4"))
 
 
 def expected_chunk_count(duration_seconds, window_seconds=120):
@@ -49,7 +55,7 @@ def _write_chunk(input_path, start, end, out_path, copy_kwargs, encode_kwargs):
 
 
 def chunk_video(input_path, output_dir, window_seconds=120, max_chunks=None,
-                chunk_indices=None):
+                chunk_indices=None, workers=CHUNK_WORKERS):
     """
     Takes a lecture .mp4 and splits it into 2-minute windows.
     For each window, produces three files:
@@ -59,7 +65,8 @@ def chunk_video(input_path, output_dir, window_seconds=120, max_chunks=None,
 
     chunk_indices restricts the cut to those windows only (sparse sampling) --
     on a 2-hr lecture that is 32 windows instead of 60, times three variants
-    each. Indices past the end of the video are ignored.
+    each. Indices past the end of the video are ignored. Windows are cut
+    `workers` at a time.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -84,17 +91,13 @@ def chunk_video(input_path, output_dir, window_seconds=120, max_chunks=None,
     if max_chunks is not None:
         wanted = wanted[:max_chunks]
 
-    reencoded = False
-    for chunk_index in wanted:
+    reencoded = threading.Event()
+
+    def cut(chunk_index):
         start = chunk_index * window_seconds
         end = min(start + window_seconds, duration)
         chunk_name = f"chunk_{chunk_index:03d}"  # e.g. chunk_000, chunk_001
-        is_short = (end - start) < window_seconds
-
-        print(f"\nChunk {chunk_index}: {start:.1f}s -> {end:.1f}s", end="")
-        if is_short:
-            print(" [SHORT -- last window]", end="")
-        print()
+        short = " [SHORT -- last window]" if (end - start) < window_seconds else ""
 
         # Full video + audio
         mode = _write_chunk(
@@ -103,10 +106,10 @@ def chunk_video(input_path, output_dir, window_seconds=120, max_chunks=None,
             copy_kwargs={"c": "copy"},  # don't re-encode, just cut -- fast
             encode_kwargs={"vcodec": "libx264", "acodec": "aac", "preset": "veryfast"},
         )
-        if mode == "re-encode" and not reencoded:
-            print(f"  [note] source codec can't be copied into .mp4 — re-encoding "
-                  f"chunks (slower, but only per 2-min window)")
-            reencoded = True
+        if mode == "re-encode" and not reencoded.is_set():
+            reencoded.set()
+            print("  [note] source codec can't be copied into .mp4 — re-encoding "
+                  "chunks (slower, but only per 2-min window)")
 
         # Muted video (video stream only, no audio stream)
         _write_chunk(
@@ -123,5 +126,10 @@ def chunk_video(input_path, output_dir, window_seconds=120, max_chunks=None,
             copy_kwargs={"vn": None},   # "vn" = video none = strip video
             encode_kwargs={"vn": None, "acodec": "libmp3lame"},
         )
+        print(f"Chunk {chunk_index}: {start:.1f}s -> {end:.1f}s{short}")
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        # list() re-raises the first failed cut.
+        list(pool.map(cut, wanted))
 
     print(f"\nDone. {len(wanted)} chunks saved to: {output_dir}")
