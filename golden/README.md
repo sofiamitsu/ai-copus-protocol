@@ -22,6 +22,4 @@ golden/
 A results folder not listed in the manifest is ignored.
 
 `results_multimodal.csv` is the multimodal-arm output of `run.py` for that
-lecture. Commit only `window_index, window_start, window_end, copus_codes` —
-the report reads nothing else, and Gemini's free-text `reasoning` stays out of
-the repo.
+lecture. 
