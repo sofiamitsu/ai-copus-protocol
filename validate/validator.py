@@ -1,6 +1,7 @@
 import math
 import pandas as pd
 import os
+from irrCAC.raw import CAC
 from sklearn.metrics import cohen_kappa_score
 
 from validate.convert_copus_sheet import INSTRUCTOR_CODES
@@ -110,16 +111,18 @@ def binary_kappa(code, human_labels, ai_labels):
 
 def gwet_ac1(tp, fp, fn, tn):
     """
-    Gwet's AC1 for two raters and two categories (code present / absent).
+    Gwet's AC1 for two raters and two categories (code present / absent), via
+    irrCAC (Gwet's reference implementation).
 
     Gwet, K. L. (2008). Computing inter-rater reliability and its variance in
     the presence of high agreement. BJMSP, 61(1), 29-48.
 
+    For two categories this is the closed form
         pa  = (tp + tn) / n
-        pi  = mean share of "present" across both raters
-            = ((tp + fn) + (tp + fp)) / (2n)
-        pe  = 2 * pi * (1 - pi)          # sum_k pi_k (1 - pi_k) / (q - 1), q = 2
+        pi  = ((tp + fn) + (tp + fp)) / (2n)    # mean share of "present"
+        pe  = 2 * pi * (1 - pi)
         AC1 = (pa - pe) / (1 - pe)
+    which irrCAC reproduces exactly (checked on every 2x2 table up to n = 20).
 
     Unlike kappa's chance term, pe shrinks toward 0 as a code approaches 0% or
     100% prevalence, so near-perfect agreement on Lec (marked in 23 of 24 windows
@@ -128,15 +131,21 @@ def gwet_ac1(tp, fp, fn, tn):
     Returns "N/A" when there are no windows or NEITHER rater used the code. The
     formula gives 1.0 there, but that is agreement on an absence nobody
     observed; counting it would let CQ/MG/1o1 "clear" the 0.7 threshold without
-    ever appearing.
+    ever appearing. That guard is applied here, not by irrCAC (which returns 1.0).
+    Also "N/A" for a single window: irrCAC's variance step divides by n - 1.
     """
     n = tp + fp + fn + tn
     if n == 0 or tp + fp + fn == 0:
         return "N/A"
-    pa = (tp + tn) / n
-    pi = (2 * tp + fn + fp) / (2 * n)
-    pe = 2 * pi * (1 - pi)  # <= 0.5, so 1 - pe is never 0
-    return round((pa - pe) / (1 - pe), 3)
+    ratings = pd.DataFrame({
+        "human": [1] * tp + [0] * fp + [1] * fn + [0] * tn,
+        "ai":    [1] * tp + [1] * fp + [0] * fn + [0] * tn,
+    })
+    try:
+        ac1 = CAC(ratings, categories=[0, 1]).gwet()["est"]["coefficient_value"]
+    except ZeroDivisionError:
+        return "N/A"
+    return "N/A" if math.isnan(ac1) else round(ac1, 3)
 
 
 def tag_lecture(windows, lecture_key):
