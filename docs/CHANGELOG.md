@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-10-08 — reliability outputs for the thesis draft
+
+All four are additive: per-code κ / AC1 values and the ablation-deltas script are
+unchanged.
+
+1. **AC1 via irrCAC.** `gwet_ac1()` calls `irrCAC.raw.CAC(...).gwet()` instead of the
+   hand-rolled Gwet (2008) formula (landed in 3f976ea). The N/A guards (no windows;
+   neither rater used the code) are unchanged. A new test checks it against the old
+   formula on the Lec 23/24 case: both give 0.957.
+2. **Precision and recall per code.** `precision` = TP / (TP + FP) and `recall` =
+   TP / (TP + FN), 3 decimals, `N/A` on a zero denominator. Added as the last columns of
+   `combined_kappa.csv` (`ai_vs_sofia_precision`, `ai_vs_sofia_recall`) and
+   `comparison_table.csv` (`<arm>_precision`, `<arm>_recall`), and to the Faculty
+   Feedback Report's per-code table. Blank on summary rows.
+3. **Aggregate agreement rows.** `overall_raw_agreement_pct`, `pooled_kappa` and
+   `prevalence_weighted_mean_kappa` at the bottom of both tables, over the codes the
+   human marked. The PDF shows them in a smaller "Overall Agreement" note under the
+   per-code table, labelled supplementary to the per-code view.
+4. **Paste-ready threshold rows.** The `codes_clearing_kappa_0.7` / `codes_clearing_ac1_0.7`
+   cells now read `"3 of 5"` instead of a bare count, so Table 6.1 can be pasted from
+   the CSV. `n_codes_human_observed` is still filled in, and the PDF reads both formats.
+
 ## 2026-09 — parallel runs and repo cleanup
 
 - **Parallel execution.** Lectures, ablation arms and windows now run concurrently. A

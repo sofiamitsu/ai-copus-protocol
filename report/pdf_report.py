@@ -56,7 +56,8 @@ PASSIVE_CODES = {"Lec", "RtW", "Adm", "W"}
 
 from validate.convert_copus_sheet import INSTRUCTOR_CODES
 from validate.validator import (
-    AC1_CLEAR_LABEL, KAPPA_CLEAR_LABEL, MEAN_ROW_LABEL, SUMMARY_LABELS, mean_kappa,
+    AC1_CLEAR_LABEL, KAPPA_CLEAR_LABEL, MEAN_ROW_LABEL, POOLED_KAPPA_LABEL,
+    RAW_AGREEMENT_LABEL, SUMMARY_LABELS, WEIGHTED_KAPPA_LABEL, mean_kappa,
 )
 from report.feedback_sections import (
     DEFAULT_DATA_DIR, code_shares, cucei_context_lines, cucei_profile,
@@ -422,6 +423,14 @@ def _styles():
     styles.add(ParagraphStyle(
         "Narrative", parent=styles["Normal"], fontSize=10.5, leading=15,
         spaceBefore=8, spaceAfter=8))
+    # Smaller than the 9 pt validation table, so the aggregate note reads as
+    # subordinate to the per-code view.
+    styles.add(ParagraphStyle(
+        "AggH", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=8.5,
+        leading=11, textColor=colors.HexColor("#003366"), spaceBefore=10))
+    styles.add(ParagraphStyle(
+        "AggNote", parent=styles["Normal"], fontSize=8, leading=10.5,
+        textColor=colors.HexColor("#555555"), spaceBefore=2))
     return styles
 
 
@@ -570,12 +579,14 @@ def _cucei_table(rows, styles):
 def _validation_table(df):
     """
     Per-code validation from the combined_kappa.csv written by run.py:
-    Code | Human windows | AI windows | Agreement | kappa | AC1.
+    Code | Human windows | AI windows | Agreement | kappa | AC1 | Precision | Recall.
     kappa and AC1 are colored by the same reliability bands.
     """
     rows = df[~df["code"].isin(SUMMARY_LABELS) & (df["code"] != MEAN_ROW_LABEL)]
     has_ac1 = "ai_vs_sofia_ac1" in df.columns
-    header = ["Code", "Human", "AI", "Agree", "κ"] + (["AC1"] if has_ac1 else [])
+    has_pr = {"ai_vs_sofia_precision", "ai_vs_sofia_recall"} <= set(df.columns)
+    header = (["Code", "Human", "AI", "Agree", "κ"] + (["AC1"] if has_ac1 else [])
+              + (["Precision", "Recall"] if has_pr else []))
     data = [header]
     style_extra = [("ALIGN", (1, 0), (-1, -1), "CENTER")]
     grey = colors.HexColor("#9E9E9E")
@@ -594,8 +605,11 @@ def _validation_table(df):
         if has_ac1:
             line.append(_fmt(r["ai_vs_sofia_ac1"]))
             style_extra.append(("TEXTCOLOR", (5, i), (5, i), band(r["ai_vs_sofia_ac1"])))
+        if has_pr:
+            line += [_fmt(r["ai_vs_sofia_precision"]), _fmt(r["ai_vs_sofia_recall"])]
         data.append(line)
-    widths = [0.8, 0.8, 0.8, 0.9, 0.9] + ([0.9] if has_ac1 else [])
+    widths = ([0.7, 0.7, 0.7, 0.75, 0.75] + ([0.75] if has_ac1 else [])
+              + ([0.8, 0.75] if has_pr else []))
     t = Table(data, colWidths=[w * inch for w in widths])
     t.setStyle(_table_style(style_extra))
     return t
@@ -608,14 +622,50 @@ def _clearing_summary(df):
     for label, col, name in ((KAPPA_CLEAR_LABEL, "ai_vs_sofia_kappa", "κ"),
                              (AC1_CLEAR_LABEL, "ai_vs_sofia_ac1", "AC1")):
         if label in s.index and col in s.columns:
-            cleared = _fmt(s.loc[label, col], ".0f")
-            denom = _fmt(s.loc[label].get("n_codes_human_observed"), ".0f")
+            cell = str(s.loc[label, col]).strip()
+            if " of " in cell:
+                # Current format: the cell is already "a of b".
+                cleared, denom = (part.strip() for part in cell.split(" of ", 1))
+            else:
+                # Older tables: a bare count, denominator in its own column.
+                cleared = _fmt(cell, ".0f")
+                denom = _fmt(s.loc[label].get("n_codes_human_observed"), ".0f")
             parts.append(f"{name} ≥ 0.7 on <b>{cleared} of {denom}</b>")
     if not parts:
         return None
     return ("The AI reached the standard COPUS reliability threshold (Smith et al., "
             "2013) with " + " and ".join(parts) + " of the behaviors the human "
             "observer recorded in your class.")
+
+
+AGGREGATE_CAVEAT = (
+    "These aggregate values are presented as supplementary; per-code reliability "
+    "(above) is the primary analytical view, as aggregate values can be inflated by "
+    "true-negative dominance from low-prevalence codes.")
+
+
+def _overall_agreement(df, styles):
+    """
+    The small "Overall Agreement" subsection under the per-code table, from the
+    aggregate rows of combined_kappa.csv. [] when the table predates them.
+    """
+    s = df.set_index("code")
+    if not {RAW_AGREEMENT_LABEL, POOLED_KAPPA_LABEL, WEIGHTED_KAPPA_LABEL} <= set(s.index):
+        return []
+    raw = _fmt(s.loc[RAW_AGREEMENT_LABEL].get("pct_agreement"), ".1f")
+    pooled = _fmt(s.loc[POOLED_KAPPA_LABEL].get("ai_vs_sofia_kappa"), ".3f")
+    weighted = _fmt(s.loc[WEIGHTED_KAPPA_LABEL].get("ai_vs_sofia_kappa"), ".3f")
+    raw_text = "N/A" if raw == "N/A" else f"{raw}%"
+    return [
+        Paragraph("Overall Agreement", styles["AggH"]),
+        Paragraph(
+            f"Across every behavior the human observer recorded, the AI and the "
+            f"observer agreed on {raw_text} of segment-by-behavior decisions. "
+            f"Pooled Cohen's κ was {pooled}, and the prevalence-weighted mean κ "
+            f"(each behavior weighted by how often the observer recorded it) was "
+            f"{weighted}.", styles["AggNote"]),
+        Paragraph(f"<i>{AGGREGATE_CAVEAT}</i>", styles["AggNote"]),
+    ]
 
 
 def generate_faculty_report(
@@ -885,7 +935,9 @@ def generate_faculty_report(
         validation.append(Paragraph(
             "Part of each lecture was also coded by a trained human observer. The "
             "table compares the AI with that observer, per behavior: how many "
-            "segments each marked, how often they agreed, Cohen's κ, and Gwet's AC1. "
+            "segments each marked, how often they agreed, Cohen's κ, Gwet's AC1, and "
+            "the AI's precision (share of its marks the observer also made) and "
+            "recall (share of the observer's marks the AI also made). "
             "AC1 stays meaningful when a behavior fills almost every segment (such as "
             "lecturing), where κ can fall to near zero despite near-perfect agreement. "
             "N/A means neither observer recorded that behavior; grey values are "
@@ -895,6 +947,7 @@ def generate_faculty_report(
         if summary:
             validation.append(Paragraph(summary, styles["Narrative"]))
         validation.append(_legend_flowable(styles))
+        validation.extend(_overall_agreement(kappa_df, styles))
     elif kappa_results:
         kappa_dict = load_kappa_dict(kappa_results)
         validation.append(Paragraph(

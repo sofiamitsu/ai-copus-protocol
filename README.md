@@ -24,8 +24,10 @@ measure which input each COPUS code actually depends on.
   one shared prompt, the same windows and the same model.
 - **Parallel execution.** Lectures, arms and windows run concurrently, with a single cap
   on in-flight API calls.
-- **Reliability statistics**: per-code prevalence, % agreement, Cohen's κ and Gwet's AC1.
-  Undefined κ is reported as `N/A`, not as 0.
+- **Reliability statistics**: per-code prevalence, % agreement, Cohen's κ, Gwet's AC1
+  (computed with the [`irrCAC`](https://pypi.org/project/irrCAC/) package), and the AI's
+  precision and recall against the human. Undefined values are reported as `N/A`, not
+  as 0. Three supplementary aggregate measures sit below the per-code rows.
 - **Reproducible**: decoding is pinned (temperature 0 and a fixed seed), every result
   records the model that produced it, and reruns reuse cached results instead of calling
   the API again.
@@ -205,7 +207,7 @@ effect on the output.
 
 ```
 output/dr_smith/
-├── combined_kappa.csv            # pooled κ / AC1 per code across lectures
+├── combined_kappa.csv            # pooled κ / AC1 / precision / recall per code
 ├── professor_dashboard.html      # all lectures on one timeline
 ├── lecture_professor_mapping.csv
 ├── survey_analysis.csv           # if a survey was given
@@ -249,12 +251,38 @@ The full definitions and exclusion rules the model follows are in
   reported as `N/A` and excluded from averages. Codes with very high prevalence (Lec is
   often above 90%) push κ down even when agreement is high, which is why Gwet's AC1 is
   reported alongside it.
+- **Per-code table.** `combined_kappa.csv` and `comparison_table.csv` have one row per
+  COPUS code: prevalence, % agreement, Cohen's κ, Gwet's AC1 (via `irrCAC`), then
+  `precision` = TP / (TP + FP) and `recall` = TP / (TP + FN) of the AI against the human
+  (3 decimals, `N/A` on a zero denominator; `<arm>_precision` / `<arm>_recall` in the
+  comparison table). The `codes_clearing_kappa_0.7` / `codes_clearing_ac1_0.7` rows
+  below them hold a ready-to-paste string such as `3 of 5`, counted over the codes the
+  human marked at least once.
 - **Pinned decoding.** Classification runs at temperature 0 with a fixed seed. Both are
   written into every result JSON, and the runner warns if cached results were produced
   with different settings.
 - **Transcription** for the transcript arm always uses Flash, whatever `--model` is,
   because it is speech recognition rather than the variable under study. It is recorded
   separately as `transcribe_model`.
+
+### Aggregate agreement measures
+
+Three rows at the bottom of `combined_kappa.csv` and `comparison_table.csv`, below the
+threshold-count rows, summarise agreement across all codes the human marked at least
+once:
+
+| Row | Column | Definition |
+|---|---|---|
+| `overall_raw_agreement_pct` | % agreement | Σ(TP + TN) / Σ(TP + TN + FP + FN) × 100, 1 decimal |
+| `pooled_kappa` | κ | Cohen's κ on the per-code human / AI vectors concatenated across codes, 3 decimals |
+| `prevalence_weighted_mean_kappa` | κ | Σ(n_human_marked × κ) / Σ n_human_marked over codes with a numeric κ, 3 decimals |
+
+Each is `N/A` when undefined. The Faculty Feedback Report shows them in a small
+"Overall Agreement" note under the per-code table.
+
+These are **supplementary, not primary**. Per-code reliability is the analytical view:
+pooling across codes lets the many true negatives of low-prevalence codes inflate
+agreement, so a high aggregate can hide codes the AI gets wrong.
 
 ## Privacy and compliance
 
@@ -305,7 +333,7 @@ uv run python -m tests.test_feedback_report
 ## Tech stack
 
 Python · Google Gemini 2.5 (Vertex AI, `google-genai`) · ffmpeg · Microsoft Presidio +
-spaCy · pandas · scikit-learn · Plotly · ReportLab + Kaleido · Streamlit · uv
+spaCy · pandas · scikit-learn · irrCAC · Plotly · ReportLab + Kaleido · Streamlit · uv
 
 ## Further reading
 

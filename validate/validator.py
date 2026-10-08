@@ -13,7 +13,18 @@ MEAN_ROW_LABEL = "MEAN"
 AGREEMENT_THRESHOLD = 0.7
 KAPPA_CLEAR_LABEL = "codes_clearing_kappa_0.7"
 AC1_CLEAR_LABEL = "codes_clearing_ac1_0.7"
-SUMMARY_LABELS = (KAPPA_CLEAR_LABEL, AC1_CLEAR_LABEL)
+THRESHOLD_LABELS = (KAPPA_CLEAR_LABEL, AC1_CLEAR_LABEL)
+
+# Aggregate (all-codes) agreement rows, appended below the threshold rows.
+# Supplementary only: per-code reliability is the primary view, because pooling
+# lets true negatives from low-prevalence codes inflate the aggregate.
+RAW_AGREEMENT_LABEL = "overall_raw_agreement_pct"
+POOLED_KAPPA_LABEL = "pooled_kappa"
+WEIGHTED_KAPPA_LABEL = "prevalence_weighted_mean_kappa"
+AGGREGATE_LABELS = (RAW_AGREEMENT_LABEL, POOLED_KAPPA_LABEL, WEIGHTED_KAPPA_LABEL)
+
+# Every non-code row a kappa table can end with.
+SUMMARY_LABELS = THRESHOLD_LABELS + AGGREGATE_LABELS
 
 # Short arm names used in the prevalence / % agreement column names.
 ARM_SHORT = {
@@ -148,6 +159,73 @@ def gwet_ac1(tp, fp, fn, tn):
     return "N/A" if math.isnan(ac1) else round(ac1, 3)
 
 
+def precision_recall(tp, fp, fn):
+    """
+    (precision, recall) of the AI against the human for one code, each rounded
+    to 3 decimals, or "N/A" when its denominator is zero:
+        precision = tp / (tp + fp)    # of the windows the AI marked
+        recall    = tp / (tp + fn)    # of the windows the human marked
+    """
+    precision = round(tp / (tp + fp), 3) if tp + fp else "N/A"
+    recall = round(tp / (tp + fn), 3) if tp + fn else "N/A"
+    return precision, recall
+
+
+def aggregate_agreement(rows):
+    """
+    Three all-codes agreement measures over the codes the human marked at least
+    once (see observed_rows), from agreement_by_code rows:
+
+      overall_raw_agreement_pct       sum(tp + tn) / sum(tp + tn + fp + fn) * 100,
+                                      1 decimal
+      pooled_kappa                    Cohen's kappa on the per-code human / AI
+                                      binary vectors concatenated across codes,
+                                      3 decimals
+      prevalence_weighted_mean_kappa  per-code kappa weighted by n_human_marked,
+                                      N/A codes skipped, 3 decimals
+
+    Each is "N/A" when undefined (no observed codes / no numeric kappa). These
+    are supplementary: true negatives from low-prevalence codes inflate them.
+    """
+    obs = observed_rows(rows)
+
+    matches = sum(r["tp"] + r["tn"] for r in obs)
+    decisions = sum(r["tp"] + r["tn"] + r["fp"] + r["fn"] for r in obs)
+    raw = round(100.0 * matches / decisions, 1) if decisions else "N/A"
+
+    # The concatenated vectors are fully determined by each code's 2x2 counts,
+    # and kappa does not depend on window order.
+    human, ai = [], []
+    for r in obs:
+        for h, a, k in ((1, 1, r["tp"]), (0, 1, r["fp"]), (1, 0, r["fn"]), (0, 0, r["tn"])):
+            human += [h] * k
+            ai += [a] * k
+    pooled = "N/A"
+    if human:
+        try:
+            k = cohen_kappa_score(human, ai)
+            pooled = "N/A" if math.isnan(k) else round(k, 3)
+        except Exception as e:
+            pooled = f"ERR: {e}"
+
+    weighted = [(r["n_human_marked"], float(k)) for r in obs
+                for k in [pd.to_numeric(r["kappa"], errors="coerce")] if pd.notna(k)]
+    total_w = sum(w for w, _ in weighted)
+    weighted_kappa = (round(sum(w * k for w, k in weighted) / total_w, 3)
+                      if total_w else "N/A")
+
+    return {
+        RAW_AGREEMENT_LABEL: raw,
+        POOLED_KAPPA_LABEL: pooled,
+        WEIGHTED_KAPPA_LABEL: weighted_kappa,
+    }
+
+
+def clearing_cell(cleared, n_observed):
+    """Threshold-count cell, pasted verbatim into thesis Table 6.1: "3 of 5"."""
+    return f"{cleared} of {n_observed}"
+
+
 def tag_lecture(windows, lecture_key):
     """
     Key each window by (lecture_key, window_index) before pooling lectures.
@@ -189,7 +267,8 @@ def agreement_by_code(human_windows, ai_windows, codes=INSTRUCTOR_CODES):
       n_total_windows, n_human_marked, n_ai_marked,
       tp (both marked), fp (AI only), fn (human only), tn (neither),
       pct_agreement = (tp + tn) / n_total_windows, as a percentage,
-      kappa (Cohen), ac1 (Gwet)
+      kappa (Cohen), ac1 (Gwet),
+      precision = tp / (tp + fp), recall = tp / (tp + fn) (AI against human)
 
     Only windows present in BOTH lists are scored. Confusion matrices across
     codes are not defined for multi-label output; these per-code 2x2 tables are.
@@ -211,6 +290,7 @@ def agreement_by_code(human_windows, ai_windows, codes=INSTRUCTOR_CODES):
         fp = sum(1 for h, a in zip(human_labels, ai_labels) if a and not h)
         fn = sum(1 for h, a in zip(human_labels, ai_labels) if h and not a)
         tn = n - tp - fp - fn
+        precision, recall = precision_recall(tp, fp, fn)
         rows.append({
             "code": code,
             "n_total_windows": n,
@@ -220,6 +300,8 @@ def agreement_by_code(human_windows, ai_windows, codes=INSTRUCTOR_CODES):
             "pct_agreement": round(100.0 * (tp + tn) / n, 1) if n else "N/A",
             "kappa": binary_kappa(code, human_labels, ai_labels),
             "ac1": gwet_ac1(tp, fp, fn, tn),
+            "precision": precision,
+            "recall": recall,
         })
     return rows
 
@@ -395,9 +477,13 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False,
     warning. Otherwise one arm's failure changes its denominator and the arms are
     no longer a paired comparison.
 
-    The table ends with two summary rows instead of a mean: how many of the 12
-    codes clear 0.7 on kappa, and on AC1, per arm. An unweighted mean of kappa is
-    not reported -- it mixes N/A codes and wildly different prevalences.
+    The table ends with two summary rows instead of a mean: how many of the
+    human-observed codes clear 0.7 on kappa, and on AC1, per arm, written as
+    "3 of 5". An unweighted mean of kappa is not reported -- it mixes N/A codes
+    and wildly different prevalences. Below those come the three supplementary
+    aggregate rows from aggregate_agreement (overall raw % agreement in the
+    pct_agreement columns; pooled and prevalence-weighted kappa in the kappa
+    columns).
     """
     lecture_arm_csvs = _normalize_arm_csvs(arm_csvs)
     human_csvs = human_csv if isinstance(human_csv, (list, tuple)) else [human_csv]
@@ -469,16 +555,29 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False,
                 row[f"{arm}_ac1"] = table[arm][i]["ac1"]
             for arm in arms:
                 row[f"pct_agreement_{ARM_SHORT[arm]}"] = table[arm][i]["pct_agreement"]
+            for arm in arms:
+                row[f"{arm}_precision"] = table[arm][i]["precision"]
+            for arm in arms:
+                row[f"{arm}_recall"] = table[arm][i]["recall"]
             rows.append(row)
         for label, metric in ((KAPPA_CLEAR_LABEL, "kappa"), (AC1_CLEAR_LABEL, "ac1")):
             row = dict(prefix)
             row["code"] = label
             for arm in arms:
                 cleared, n_obs = count_clearing_observed(table[arm], metric)
-                row[f"{arm}_{metric}"] = cleared
+                row[f"{arm}_{metric}"] = clearing_cell(cleared, n_obs)
                 # Denominator: codes the human marked at least once. Same for
                 # every arm (the human coding does not change between arms).
                 row["n_codes_human_observed"] = n_obs
+            rows.append(row)
+        aggregates = {arm: aggregate_agreement(table[arm]) for arm in arms}
+        for label, column in ((RAW_AGREEMENT_LABEL, "pct_agreement_{short}"),
+                              (POOLED_KAPPA_LABEL, "{arm}_kappa"),
+                              (WEIGHTED_KAPPA_LABEL, "{arm}_kappa")):
+            row = dict(prefix)
+            row["code"] = label
+            for arm in arms:
+                row[column.format(arm=arm, short=ARM_SHORT[arm])] = aggregates[arm][label]
             rows.append(row)
         return rows
 
@@ -488,7 +587,9 @@ def compute_comparison_table(arm_csvs, human_csv, output_csv, per_lecture=False,
                 + [f"n_ai_marked_{ARM_SHORT[a]}" for a in arms]
                 + [f"{a}_kappa" for a in arms]
                 + [f"{a}_ac1" for a in arms]
-                + [f"pct_agreement_{ARM_SHORT[a]}" for a in arms])
+                + [f"pct_agreement_{ARM_SHORT[a]}" for a in arms]
+                + [f"{a}_precision" for a in arms]
+                + [f"{a}_recall" for a in arms])
 
     # Pooled table (main output)
     pooled_prof_id = "|".join(sorted({p for p in lecture_prof_ids if p}))

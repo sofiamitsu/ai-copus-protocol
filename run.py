@@ -47,6 +47,11 @@ from validate.convert_copus_sheet import convert
 from validate.validator import (
     AC1_CLEAR_LABEL,
     KAPPA_CLEAR_LABEL,
+    POOLED_KAPPA_LABEL,
+    RAW_AGREEMENT_LABEL,
+    WEIGHTED_KAPPA_LABEL,
+    aggregate_agreement,
+    clearing_cell,
     agreement_by_code,
     compute_kappa,
     compute_comparison_table,
@@ -284,8 +289,9 @@ def build_combined_kappa(lecture_infos, output_csv):
     """
     Pool every lecture's windows and compute AI-vs-Sofia agreement per code
     (all 12 COPUS instructor codes), giving a professor-level reliability table:
-    prevalence, % agreement, Cohen's kappa and Gwet's AC1, followed by rows
-    counting how many codes clear 0.7 on each -- no unweighted mean.
+    prevalence, % agreement, Cohen's kappa, Gwet's AC1, precision and recall,
+    followed by rows counting how many codes clear 0.7 on each ("3 of 5") -- no
+    unweighted mean -- and then the three supplementary aggregate rows.
     """
     ai, sofia = [], []
     for k, info in enumerate(lecture_infos):
@@ -298,7 +304,8 @@ def build_combined_kappa(lecture_infos, output_csv):
     prof_id = "|".join(sorted({i["professor_id"] for i in lecture_infos}))
     cols = ["professor_id", "code", "n_total_windows", "n_human_marked",
             "n_codes_human_observed", "n_ai_marked", "pct_agreement",
-            "ai_vs_sofia_kappa", "ai_vs_sofia_ac1"]
+            "ai_vs_sofia_kappa", "ai_vs_sofia_ac1",
+            "ai_vs_sofia_precision", "ai_vs_sofia_recall"]
     rows = [{
         "professor_id": prof_id,
         "code": r["code"],
@@ -308,6 +315,8 @@ def build_combined_kappa(lecture_infos, output_csv):
         "pct_agreement": r["pct_agreement"],
         "ai_vs_sofia_kappa": r["kappa"],
         "ai_vs_sofia_ac1": r["ac1"],
+        "ai_vs_sofia_precision": r["precision"],
+        "ai_vs_sofia_recall": r["recall"],
     } for r in stats]
     # Threshold counts are scored only over codes the human marked at least once
     # (see validator.observed_rows); n_codes_human_observed is the denominator.
@@ -315,26 +324,39 @@ def build_combined_kappa(lecture_infos, output_csv):
     ac1_cleared, _ = count_clearing_observed(stats, "ac1")
     rows.append({"professor_id": prof_id, "code": KAPPA_CLEAR_LABEL,
                  "n_codes_human_observed": n_observed,
-                 "ai_vs_sofia_kappa": kappa_cleared})
+                 "ai_vs_sofia_kappa": clearing_cell(kappa_cleared, n_observed)})
     rows.append({"professor_id": prof_id, "code": AC1_CLEAR_LABEL,
                  "n_codes_human_observed": n_observed,
-                 "ai_vs_sofia_ac1": ac1_cleared})
+                 "ai_vs_sofia_ac1": clearing_cell(ac1_cleared, n_observed)})
+    # Supplementary all-codes measures; per-code reliability stays the primary view.
+    agg = aggregate_agreement(stats)
+    rows.append({"professor_id": prof_id, "code": RAW_AGREEMENT_LABEL,
+                 "pct_agreement": agg[RAW_AGREEMENT_LABEL]})
+    rows.append({"professor_id": prof_id, "code": POOLED_KAPPA_LABEL,
+                 "ai_vs_sofia_kappa": agg[POOLED_KAPPA_LABEL]})
+    rows.append({"professor_id": prof_id, "code": WEIGHTED_KAPPA_LABEL,
+                 "ai_vs_sofia_kappa": agg[WEIGHTED_KAPPA_LABEL]})
     df = pd.DataFrame(rows, columns=cols)
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     df.to_csv(output_csv, index=False)
 
     n = stats[0]["n_total_windows"] if stats else 0
     print(f"\n=== Combined agreement (pooled across lectures, {n} windows) ===")
-    header = f"{'Code':<8}{'Human+':>8}{'AI+':>6}{'Agree%':>8}{'kappa':>8}{'AC1':>8}"
+    header = (f"{'Code':<8}{'Human+':>8}{'AI+':>6}{'Agree%':>8}{'kappa':>8}{'AC1':>8}"
+              f"{'Prec':>8}{'Recall':>8}")
     print(header)
     print("-" * len(header))
     for r in stats:
         print(f"{r['code']:<8}{r['n_human_marked']:>8}{r['n_ai_marked']:>6}"
-              f"{str(r['pct_agreement']):>8}{str(r['kappa']):>8}{str(r['ac1']):>8}")
+              f"{str(r['pct_agreement']):>8}{str(r['kappa']):>8}{str(r['ac1']):>8}"
+              f"{str(r['precision']):>8}{str(r['recall']):>8}")
     print("-" * len(header))
     print(f"Codes clearing 0.7: kappa {kappa_cleared}/{n_observed}, "
           f"AC1 {ac1_cleared}/{n_observed}  "
           f"(of the {n_observed} code(s) the human marked at least once)")
+    print(f"Aggregate (supplementary): raw agreement {agg[RAW_AGREEMENT_LABEL]}%, "
+          f"pooled kappa {agg[POOLED_KAPPA_LABEL]}, prevalence-weighted kappa "
+          f"{agg[WEIGHTED_KAPPA_LABEL]}")
     print("(N/A = undefined: neither rater used the code; never clears 0.7)")
     print(f"\nCombined agreement saved → {output_csv}")
     return df
